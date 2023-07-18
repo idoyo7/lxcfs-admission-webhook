@@ -1,6 +1,6 @@
 PROJECT_NAME := lxcfs-admission-webhook
 VERSION := $(shell git describe --tags)
-COMMIT_ID := $(shell git rev-parse --short HEAD)
+COMMIT_ID := 0.1.7
 GO_VERSION := $(shell go version)
 BUILD_TIME := $(shell date -Iseconds)
 
@@ -23,10 +23,10 @@ endif
 LDFLAGS := "-X 'main.Version=$(VERSION)' -X 'main.GoVersion=$(GO_VERSION)' -X 'main.GitCommit=$(COMMIT_ID)' -X 'main.BuildTime=$(BUILD_TIME)'"
 
 # Docker related variables.
-DOCKER_USER := ymping
+DOCKER_USER := <YOUR_DOCKER_USERNAME>
 DOCKER_IMAGE_WH := $(DOCKER_USER)/$(PROJECT_NAME)
 DOCKER_IMAGE_LXCFS := $(DOCKER_USER)/lxcfs
-DOCKER_TAG_LXCFS := $(shell source $(BASE_DIR)/lxcfs-image/.env && echo $${LXCFS_VERSION})
+DOCKER_TAG_LXCFS := 5.0.3-r1
 
 .PHONY: all dep lint vet test test-coverage build clean start-wh build-image-wh push-image-wh build-image-lxcfs push-image-lxcfs
 
@@ -65,7 +65,7 @@ run-wh: build ## Start lxcfs admission webhook
 					2>&1
 
 build-image-wh: ## Build lxcfs admission webhook docker images
-	@docker build -t $(DOCKER_IMAGE_WH):$(COMMIT_ID) .
+	@docker build --no-cache -t $(DOCKER_IMAGE_WH):$(COMMIT_ID) .
 
 push-image-wh: build-image-wh ## Push lxcfs admission webhook docker images
 	@docker push $(DOCKER_IMAGE_WH):$(COMMIT_ID)

@@ -6,8 +6,8 @@ PATH=$PATH:/bin
 LXC_PATH="/var/lib/lxc"
 LXCFS_PATH="${LXC_PATH}/lxcfs"
 
-ACTION_UMOUNT="UMOUNT"
-ACTION_REMOUNT="REMOUNT"
+UMOUNT=false
+REMOUNT=false
 
 # echo script usage
 usage() {
@@ -36,20 +36,25 @@ The following one flag are required
   --remount           umount fuse.lxcfs filesystem mount in container and remount it
 
 EOF
+
+  exit 0
 }
 
 # check python3, nsenter, crictl or docker command exist on k8s cluster
 pre_check() {
-  for c in python3 nsenter; do
-    if ! command -v $c >/dev/null; then
-      echo $c not found on host, exit
-      exit 2
-    fi
-  done
+  if ! command -v python3 >/dev/null; then
+    echo python3 interpreter not found on host, exit
+    exit 1
+  fi
+
+  if ! command -v nsenter >/dev/null; then
+    echo nsenter not found on host, exit
+    exit 1
+  fi
 
   if ! command -v crictl >/dev/null && ! command -v docker >/dev/null; then
     echo container cli command crictl or docker not found on host, exit
-    exit 2
+    exit 1
   fi
 }
 
@@ -107,13 +112,13 @@ lxcfs_umount() {
 lxcfs_mount() {
   container_pid=$1
 
-  if [[ ${ACTION} == "${ACTION_REMOUNT}" ]]; then
+  if [[ "$REMOUNT" == true ]]; then
     lxcfs_remount "$container_pid"
-  elif [[ ${ACTION} == "${ACTION_UMOUNT}" ]]; then
+  elif [[ "$UMOUNT" == true ]]; then
     lxcfs_umount "$container_pid"
   else
-    echo "unknown action: ${ACTION}, exit"
-    exit 22
+    echo "unknown action got, exit"
+    exit 1
   fi
 }
 
@@ -169,28 +174,29 @@ crictl_cli() {
 main() {
   pre_check
 
-  case $1 in
-  --umount)
-    ACTION=${ACTION_UMOUNT}
-    ;;
-  --remount)
-    ACTION=${ACTION_REMOUNT}
-    # wait 3 seconds to start lxcfs
-    # for post-start hook is executed immediately after a container is created
-    sleep 3
-    ;;
-  *)
+  if [[ $# -eq 1 ]]; then
+    case $1 in
+    --umount)
+      UMOUNT=true
+      ;;
+    --remount)
+      REMOUNT=true
+      # wait 3 seconds to start lxcfs
+      # for post-start hook is executed immediately after a container is created
+      sleep 3
+      ;;
+    *)
+      usage
+      ;;
+    esac
+  else
     usage
-    ;;
-  esac
+  fi
 
   if command -v docker >/dev/null; then
     docker_cli
-  elif command -v crictl >/dev/null; then
-    crictl_cli
   else
-    echo container cli command crictl or docker not found on host, exit
-    exit 2
+    crictl_cli
   fi
 }
 

@@ -226,10 +226,9 @@ func patchAnnotation(target, added map[string]string) (patches []patchOperation)
 	for key, value := range added {
 		var op = patchOperation{
 			Op:   "add",
-			Path: "/metadata/annotations",
-			Value: map[string]string{
-				key: value,
-			},
+                        Path: "/metadata/annotations/" + escapeJSONPointerValue(key),
+                        Value: value,
+
 		}
 
 		if target != nil {
