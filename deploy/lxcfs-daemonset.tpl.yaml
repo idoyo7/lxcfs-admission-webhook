@@ -30,7 +30,7 @@ spec:
                       - linux
       containers:
         - name: lxcfs
-          image: montkim9/lxcfs:5.0.3-r1
+          image: montkim9/lxcfs:6.0.1-r1
           imagePullPolicy: Always
           securityContext:
             privileged: true

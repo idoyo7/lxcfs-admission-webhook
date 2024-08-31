@@ -26,7 +26,7 @@ LDFLAGS := "-X 'main.Version=$(VERSION)' -X 'main.GoVersion=$(GO_VERSION)' -X 'm
 DOCKER_USER := <YOUR_DOCKER_USERNAME>
 DOCKER_IMAGE_WH := $(DOCKER_USER)/$(PROJECT_NAME)
 DOCKER_IMAGE_LXCFS := $(DOCKER_USER)/lxcfs
-DOCKER_TAG_LXCFS := 5.0.3-r1
+DOCKER_TAG_LXCFS := 6.0.1-r0
 
 .PHONY: all dep lint vet test test-coverage build clean start-wh build-image-wh push-image-wh build-image-lxcfs push-image-lxcfs
 
