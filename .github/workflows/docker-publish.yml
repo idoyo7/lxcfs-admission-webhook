@@ -54,6 +54,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Read LXCFS upstream version
+        id: lxcfsenv
+        run: |
+          # Sourced regardless of matrix entry so the step output is
+          # always defined; the corresponding tag rule is gated below.
+          # shellcheck disable=SC1091
+          . lxcfs-image/.env
+          echo "version=${LXCFS_VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -66,6 +75,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
+            type=raw,value=${{ steps.lxcfsenv.outputs.version }},enable=${{ matrix.image == 'lxcfs' }}
 
       - name: Build and push
         id: build-and-push
