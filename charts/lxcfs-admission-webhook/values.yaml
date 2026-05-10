@@ -69,18 +69,28 @@ lxcfs:
                   - linux
   nodeSelector: {}
 
-# cert-manager managed serving certificate
+# cert-manager managed serving certificate.
+# Both CA and serving cert default to ~100 years. Rationale:
+#   - The cert is private (only kube-apiserver dials this Service);
+#     it never traverses the public internet, so the 398-day rule for
+#     publicly-trusted CAs does not apply.
+#   - The webhook Deployment loads the cert at startup and does not
+#     watch the Secret for rotations. A short-lived cert that gets
+#     rotated by cert-manager would not be picked up until a Pod
+#     restart, leading to silent mTLS failure once the in-memory cert
+#     expires. A 100y cert sidesteps the reload gap entirely.
+#   - Tighten these values if your security policy requires shorter
+#     rotation; combine with an operator like stakater/Reloader to
+#     restart the Deployment on Secret changes.
 certificate:
   ca:
-    # -- Lifetime of the local CA cert (10y default)
-    duration: 87600h
+    duration: 876000h
     privateKey:
       algorithm: RSA
       size: 4096
   serving:
-    # -- Lifetime of the webhook serving cert (1y default)
-    duration: 8760h
-    # -- Renew this long before expiry (30d default)
+    duration: 876000h
+    # Renew well before expiry. Mostly symbolic at 100y duration.
     renewBefore: 720h
     privateKey:
       algorithm: RSA
