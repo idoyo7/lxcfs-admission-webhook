@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"github.com/golang/glog"
 	"gotest.tools/assert"
-	"io/ioutil"
+	"io"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -354,7 +354,7 @@ func TestStartWebhookServer(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	respBodyByte, err := ioutil.ReadAll(resp.Body)
+	respBodyByte, err := io.ReadAll(resp.Body)
 	respBody := string(respBodyByte)
 	if respBody != exceptRespBody {
 		t.Errorf("got unexpected body: got %v ,except %v", respBody, exceptRespBody)
