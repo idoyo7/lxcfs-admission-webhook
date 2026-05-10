@@ -15,7 +15,12 @@ ENV LXCFS_VERSION=${LXCFS_VERSION}
 RUN chmod +x /lxcfs/entrypoint.sh && \
     apk add --no-cache dumb-init bash lxcfs=${LXCFS_VERSION}
 
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+# dumb-init reaps zombies; entrypoint.sh prepares state then execs lxcfs
+# with whatever flags were passed. CMD is overridable via the
+# Kubernetes container.args field, which is how the chart exposes
+# `lxcfs.args` to operators (handy when LXCFS picks up new flags
+# like --enable-psi-poll in 7.x without rebuilding the image).
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/lxcfs/entrypoint.sh"]
 
-CMD ["/lxcfs/entrypoint.sh"]
+CMD ["--foreground", "--enable-loadavg", "--enable-cfs"]
 

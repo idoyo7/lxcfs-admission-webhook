@@ -34,6 +34,10 @@ spec:
         - name: lxcfs
           image: {{ include "lxcfs-admission-webhook.image" (dict "image" .Values.lxcfs.image "defaultTag" .Values.lxcfs.image.tag) }}
           imagePullPolicy: {{ .Values.lxcfs.image.pullPolicy }}
+          {{- with .Values.lxcfs.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           securityContext:
             privileged: true
           lifecycle:

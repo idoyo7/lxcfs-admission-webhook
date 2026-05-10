@@ -69,6 +69,11 @@
           "minLength": 1,
           "description": "Component suffix used to name the LXCFS DaemonSet: {release}-{componentName}"
         },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Args passed to the lxcfs binary; override to opt into new flags in 7.x+ without rebuilding the image"
+        },
         "image": {
           "type": "object",
           "additionalProperties": false,
