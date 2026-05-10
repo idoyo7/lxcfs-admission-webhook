@@ -1,260 +1,152 @@
 # lxcfs-admission-webhook
 
-from previous project(https://github.com/ymping/lxcfs-admission-webhook), few changes have been committed
+[![Go](https://github.com/idoyo7/lxcfs-admission-webhook/actions/workflows/go.yml/badge.svg)](https://github.com/idoyo7/lxcfs-admission-webhook/actions/workflows/go.yml)
+[![Publish images](https://github.com/idoyo7/lxcfs-admission-webhook/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/idoyo7/lxcfs-admission-webhook/actions/workflows/docker-publish.yml)
+[![License](https://img.shields.io/github/license/idoyo7/lxcfs-admission-webhook)](LICENSE)
 
-## Changes
+Kubernetes admission webhook that gives containers a CGroup-aware view of
+`/proc` and `/sys/devices/system/cpu/online` by bind-mounting files that a
+[LXCFS](https://linuxcontainers.org/lxcfs/introduction/) DaemonSet exposes
+on each node.
 
-1. pushed new images for LXCFS version 5. which is possible to use in Cgroup V2
-but still, LXC project can't get /proc/cpustat from Cgroup V2
-changed repository to get edge branch to get latest apk(alpine linux lxcfs package)
+When a Pod is created in a labeled namespace, the webhook patches its
+spec to add the LXCFS volume and the per-file `volumeMounts`, so commands
+like `top`, `free`, `nproc`, and language runtimes (JVM, Node, Go) read
+container-scoped CPU/memory values instead of host values.
 
+This is a maintained fork of
+[ymping/lxcfs-admission-webhook](https://github.com/ymping/lxcfs-admission-webhook).
+Recent changes:
 
-2. though I have changed gew codes from webhook.go, If deployment / pod doesn't have anotation,
-If your pod doesn't comes up, try to annotate deployment/pod from your resources which matches from "mutatingwebhookconfiguration's selector"
+- **LXCFS 6.0.1-r1**, cgroup v2 compatible.
+- **Go 1.24** toolchain, **k8s.io v0.34.1** modules.
+- **cert-manager**-issued serving certificate; install no longer needs
+  openssl or shell-based base64 plumbing.
+- **GHCR** as the canonical registry for both images:
+  `ghcr.io/idoyo7/lxcfs-admission-webhook` and `ghcr.io/idoyo7/lxcfs`.
 
+## How it works
 
+```
+                    +-----------------------+
+                    |  LXCFS DaemonSet      |
+                    |  (privileged, hostPID)|
+                    |   /var/lib/lxc/lxcfs  |
+                    +-----------+-----------+
+                                |
+                  hostPath mount on every node
+                                |
++---------+      mutate    +----v----------+
+|  kube-  | -- AdmissionReview --> webhook |
+|  api    | <-- JSON patch ------ deployment
++---------+                +---------------+
+                                |
+                                v
+                  Pod gets these added:
+                    /proc/cpuinfo  -> lxcfs/proc/cpuinfo
+                    /proc/meminfo  -> lxcfs/proc/meminfo
+                    /proc/stat     -> lxcfs/proc/stat
+                    /proc/swaps    -> lxcfs/proc/swaps
+                    /proc/uptime   -> lxcfs/proc/uptime
+                    /proc/loadavg  -> lxcfs/proc/loadavg
+                    /proc/diskstats -> lxcfs/proc/diskstats
+                    /sys/devices/system/cpu/online
+```
 
-<div id="top"></div>
-<!--
-*** Thanks for checking out the Best-README-Template. If you have a suggestion
-*** that would make this better, please fork the repo and create a pull request
-*** or simply open an issue with the tag "enhancement".
-*** Don't forget to give the project a star!
-*** Thanks again! Now go create something AMAZING! :D
--->
+The webhook only patches Pods in namespaces labeled
+`lxcfs-admission-webhook=enabled`, and skips any Pod annotated with
+`mutating.lxcfs-admission-webhook.io/enable: "false"`.
 
-<!-- PROJECT SHIELDS -->
-<!--
-*** I'm using markdown "reference style" links for readability.
-*** Reference links are enclosed in brackets [ ] instead of parentheses ( ).
-*** See the bottom of this document for the declaration of the reference variables
-*** for contributors-url, forks-url, etc. This is an optional, concise syntax you may use.
-*** https://www.markdownguide.org/basic-syntax/#reference-style-links
--->
-[![Go Report Card][go-report-card-shield]][go-report-card-url]
-[![Codecov][codecov-shield]][codecov-url]
-[![GitHub Workflow Status (event)][github-workflow-status-shield]][github-workflow-status-url]
-[![Contributors][contributors-shield]][contributors-url]
-[![Forks][forks-shield]][forks-url]
-[![Stargazers][stars-shield]][stars-url]
-[![Issues][issues-shield]][issues-url]
-[![Apache License][license-shield]][license-url]
+## Prerequisites
 
+- Kubernetes v1.16+ (uses `admissionregistration.k8s.io/v1`).
+- [cert-manager](https://cert-manager.io/) v1.x already installed in the
+  cluster — it issues and rotates the webhook's serving certificate.
+- Nodes with `fuse3` available (LXCFS 5.x+ links against libfuse3).
+- `kubectl` and `envsubst` (from `gettext`) on the operator's machine.
 
-<!-- PROJECT LOGO -->
-<br />
-<div align="center">
-  <a href="https://linuxcontainers.org/lxcfs/introduction/">
-    <img src="https://linuxcontainers.org/static/img/containers.small.png" alt="LXCFS Logo" width="80" height="80">
-  </a>
-  <strong>on</strong>
-  <a href="https://kubernetes.io/">
-    <img src="https://kubernetes.io/images/favicon.png" alt="K8s Logo" width="80" height="80">
-  </a>
+cert-manager quick install (skip if already present):
+```sh
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+kubectl -n cert-manager wait --for=condition=Available deployment --all --timeout=120s
+```
 
-<h3 align="center">LXCFS Admission Webhook</h3>
+## Install
 
-  <p align="center">
-    Correct the linux container's CGroup-view by <a href="https://linuxcontainers.org/lxcfs/introduction/">LXCFS</a> and <a href="https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/">kubernetes admission webhook</a>
-    <br />
-    <br />
-    <a href="https://github.com/ymping/lxcfs-admission-webhook"><strong>Explore the docs »</strong></a>
-    <br />
-    <br />
-    <a href="https://github.com/ymping/lxcfs-admission-webhook/issues">Report Bug</a>
-    ·
-    <a href="https://github.com/ymping/lxcfs-admission-webhook/issues">Request Feature</a>
-  </p>
-</div>
+```sh
+git clone https://github.com/idoyo7/lxcfs-admission-webhook.git
+cd lxcfs-admission-webhook/deploy
+./install.sh
+```
 
+Defaults:
 
+| Flag                    | Default                                               |
+|-------------------------|-------------------------------------------------------|
+| `--namespace`           | `lxcfs`                                               |
+| `--deployment`          | `lxcfs-admission-webhook`                             |
+| `--service`             | `lxcfs-admission-webhook`                             |
+| `--secret`              | `lxcfs-admission-webhook` (managed by cert-manager)   |
+| `--daemonset`           | `lxcfs-ds`                                            |
+| `--mutating`            | `lxcfs-admission-webhook`                             |
+| `--wh-image`            | `ghcr.io/idoyo7/lxcfs-admission-webhook:latest`       |
+| `--lxcfs-image`         | `ghcr.io/idoyo7/lxcfs:6.0.1-r1`                       |
 
-<!-- TABLE OF CONTENTS -->
-<details>
-  <summary>Table of Contents</summary>
-  <ol>
-    <li>
-      <a href="#about-the-project">About The Project</a>
-      <ul>
-        <li><a href="#built-with">Built With</a></li>
-      </ul>
-    </li>
-    <li>
-      <a href="#getting-started">Getting Started</a>
-      <ul>
-        <li><a href="#prerequisites">Prerequisites</a></li>
-        <li><a href="#installation">Installation</a></li>
-      </ul>
-    </li>
-    <li><a href="#usage">Usage</a></li>
-    <li><a href="#roadmap">Roadmap</a></li>
-    <li><a href="#contributing">Contributing</a></li>
-    <li><a href="#license">License</a></li>
-    <li><a href="#contact">Contact</a></li>
-    <li><a href="#acknowledgments">Acknowledgments</a></li>
-  </ol>
-</details>
+All defaults are overridable. `WH_IMAGE` and `LXCFS_IMAGE` also work as
+environment variables, e.g.:
+```sh
+WH_IMAGE=ghcr.io/idoyo7/lxcfs-admission-webhook:v0.2.0 ./install.sh
+```
 
-<!-- FIXED COMPONENT -->
-
-
-<!-- ABOUT THE PROJECT -->
-## About The Project
-
-[![Product Name Screen Shot][product-screenshot]](https://www.processon.com/view/link/6208d461f346fb3a0a38d972)
-
-LXCFS is a simple userspace filesystem designed to work around some current limitations of the Linux kernel.
-
-This project run LXCFS as kubernetes daemonset and expose a set of files which can be bind-mounted over kubernetes pod's /proc originals to provide CGroup-aware values.
-
-Also provide a kubernetes admission webhook make the pod which need to correct their CGroup-view to auto bind-mount LXCFS files.
-
-<p align="right">(<a href="#top">back to top</a>)</p>
-
-
-
-### Built With
-
-* [Golang](https://go.dev/)
-* [LXCFS](https://linuxcontainers.org/lxcfs/introduction/)
-* [Kubernetes Dynamic Admission Control](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/)
- 
-<p align="right">(<a href="#top">back to top</a>)</p>
-
-
-
-<!-- GETTING STARTED -->
-## Getting Started
-
-This is an example of how you may give instructions on setting up your project locally.
-To get a local copy up and running follow these simple example steps.
-
-### Prerequisites
-
-* Kubernetes version
-  Kubernetes v1.16 or above with the `admissionregistration.k8s.io/v1` API enabled. Verify that by the following command:
-  ```
-  kubectl api-versions | grep admissionregistration.k8s.io/v1
-  ```
-  The result should be:
-  ```
-  admissionregistration.k8s.io/v1
-  ```
-  The API `admissionregistration.k8s.io/v1beta1` not tested, not recommended.
-
-### Installation
-
-1. Clone the repo
-   ```sh
-   git clone https://github.com/ymping/lxcfs-admission-webhook.git
-   ```
-3. Run install script
-   
-   Default install webhook and LXCFS service in kubernetes namespace `lxcfs`,
-   use `install.sh --namespace your_ns` to deploy service in specify namespace.
-   ```sh
-   cd deploy
-   ./install.sh
-   ```
-4. Go to [usage](#usage) section see how to usage
-5. Uninstall
-
-   Default uninstall webhook and LXCFS service in kubernetes namespace `lxcfs`,
-   use `uninstall.sh --namespace your_ns` to uninstall service in specify namespace.
-   ```sh
-    cd deploy
-   ./uninstall.sh
-   ```
-
-<p align="right">(<a href="#top">back to top</a>)</p>
-
-
-
-<!-- USAGE EXAMPLES -->
 ## Usage
 
-1. Add lable `lxcfs-admission-webhook=enabled` to namespace which you want to correct the linux container's CGroup-view.
-   ```sh
-   kubectl label namespaces your_namespace lxcfs-admission-webhook=enabled
-   ```
-2. If you want disable this feature on some specify pod,
-   add an annotation `mutating.lxcfs-admission-webhook.io/enable` to the pod,
-   the webhook will skip patch this pod when create it.
+Opt a namespace in:
+```sh
+kubectl label namespace your-namespace lxcfs-admission-webhook=enabled
+```
 
-<p align="right">(<a href="#top">back to top</a>)</p>
+Subsequent Pods created in that namespace are patched automatically. To
+opt a single Pod out, set this annotation on the Pod (or its
+Deployment/StatefulSet template):
+```yaml
+metadata:
+  annotations:
+    mutating.lxcfs-admission-webhook.io/enable: "false"
+```
 
+The webhook records its decision on the Pod with the annotation
+`mutating.lxcfs-admission-webhook.io/status` set to `mutated`, `skip`,
+or `conflict`.
 
+## Uninstall
 
-<!-- ROADMAP -->
-## Roadmap
+```sh
+cd deploy
+./uninstall.sh
+```
 
-- [ ] Support helm installation
+This removes the MutatingWebhookConfiguration, Deployment, Service,
+LXCFS DaemonSet, the cert-manager Issuer/Certificate pair, and the
+Secrets they own. The namespace itself is left in place.
 
-See the [open issues](https://github.com/ymping/lxcfs-admission-webhook/issues) for a full list of proposed features (and known issues).
+## Build from source
 
-<p align="right">(<a href="#top">back to top</a>)</p>
+```sh
+make build         # binary -> ./build/lxcfs-admission-webhook
+make test          # unit tests (creates self-signed test certs)
+make build-image-wh   DOCKER_REGISTRY=ghcr.io/<you>
+make build-image-lxcfs DOCKER_REGISTRY=ghcr.io/<you>
+```
 
+CI pushes both images to GHCR on every push to `main` and on semver
+tags; see [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml).
 
-
-<!-- CONTRIBUTING -->
-## Contributing
-
-Any contributions you make are **greatly appreciated**.
-
-If you have a suggestion that would make this better, please fork the repo and create a pull request.
-
-<p align="right">(<a href="#top">back to top</a>)</p>
-
-
-
-<!-- LICENSE -->
 ## License
 
-Distributed under the Apache License 2.0. See `LICENSE` for more information.
+Apache License 2.0. See [`LICENSE`](LICENSE).
 
-<p align="right">(<a href="#top">back to top</a>)</p>
+## Maintainer
 
+idoyo7 — [idoyo7@gmail.com](mailto:idoyo7@gmail.com)
 
-
-<!-- CONTACT -->
-## Contact
-
-ymping - [ympiing@gmail.com](mailto:ympiing@gmail.com)
-
-Project Link: [https://github.com/ymping/lxcfs-admission-webhook](https://github.com/ymping/lxcfs-admission-webhook)
-
-<p align="right">(<a href="#top">back to top</a>)</p>
-
-
-
-<!-- ACKNOWLEDGMENTS -->
-## Acknowledgments
-
-* ['unknown revision v0.0.0' errors](https://github.com/kubernetes/kubernetes/issues/79384) during development,
-  run `go-get-k8s-pkg.sh vXXX` to fix, `vXXX` is kubernetes version, example `go-get-k8s-pkg.sh v1.23.3`
-
-* [how to create self signed certs](https://kubernetes.io/docs/tasks/administer-cluster/certificates/#openssl)
-
-<p align="right">(<a href="#top">back to top</a>)</p>
-
-
-
-<!-- MARKDOWN LINKS & IMAGES -->
-<!-- https://www.markdownguide.org/basic-syntax/#reference-style-links -->
-[github-workflow-status-shield]: https://img.shields.io/github/actions/workflow/status/ymping/lxcfs-admission-webhook/go.yml?event=push&logo=github&style=for-the-badge
-[github-workflow-status-url]: https://github.com/ymping/lxcfs-admission-webhook/actions/workflows/go.yml
-[go-report-card-shield]: https://goreportcard.com/badge/github.com/ymping/lxcfs-admission-webhook?style=for-the-badge
-[go-report-card-url]: https://goreportcard.com/report/github.com/ymping/lxcfs-admission-webhook
-[codecov-shield]: https://img.shields.io/codecov/c/github/ymping/lxcfs-admission-webhook?logo=codecov&style=for-the-badge
-[codecov-url]: https://app.codecov.io/gh/ymping/lxcfs-admission-webhook/
-[contributors-shield]: https://img.shields.io/github/contributors/ymping/lxcfs-admission-webhook.svg?style=for-the-badge
-[contributors-url]: https://github.com/ymping/lxcfs-admission-webhook/graphs/contributors
-[forks-shield]: https://img.shields.io/github/forks/ymping/lxcfs-admission-webhook.svg?style=for-the-badge
-[forks-url]: https://github.com/ymping/lxcfs-admission-webhook/network/members
-[stars-shield]: https://img.shields.io/github/stars/ymping/lxcfs-admission-webhook.svg?style=for-the-badge
-[stars-url]: https://github.com/ymping/lxcfs-admission-webhook/stargazers
-[issues-shield]: https://img.shields.io/github/issues/ymping/lxcfs-admission-webhook.svg?style=for-the-badge
-[issues-url]: https://github.com/ymping/lxcfs-admission-webhook/issues
-[license-shield]: https://img.shields.io/github/license/ymping/lxcfs-admission-webhook.svg?logo=apache&style=for-the-badge
-[license-url]: https://github.com/ymping/lxcfs-admission-webhook/blob/master/LICENSE
-[product-screenshot]: http://assets.processon.com/chart_image/6208c9970e3e7407d1cddc1d.png
+Original project: [ymping/lxcfs-admission-webhook](https://github.com/ymping/lxcfs-admission-webhook)
