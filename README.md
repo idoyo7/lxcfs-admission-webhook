@@ -152,6 +152,37 @@ kubectl -n cert-manager wait --for=condition=Available deployment --all --timeou
 
 ## Install
 
+There are three supported ways to install. Pick whichever fits your
+workflow.
+
+### 1. Helm from GHCR — recommended
+
+The chart is published to GHCR as an OCI artifact on every release.
+Helm 3.8+ speaks OCI natively:
+
+```sh
+helm install lxcfs-admission-webhook \
+  oci://ghcr.io/idoyo7/charts/lxcfs-admission-webhook \
+  --version 0.1.0 \
+  --namespace lxcfs --create-namespace
+```
+
+Override values via `--set` or `--values custom.yaml`. See
+[`charts/lxcfs-admission-webhook/values.yaml`](charts/lxcfs-admission-webhook/values.yaml)
+for the full schema.
+
+### 2. ArgoCD — recommended for GitOps
+
+Copy [`examples/argocd/application-oci.yaml`](examples/argocd/application-oci.yaml)
+into your GitOps repository. ArgoCD will pull the chart from the OCI
+registry and reconcile it. See [`examples/argocd/README.md`](examples/argocd/README.md)
+for the full pattern (and a git-source variant for unreleased chart
+previews).
+
+### 3. install.sh — minimal, no Helm
+
+Useful for quick clusters where you don't want to bring Helm or ArgoCD:
+
 ```sh
 git clone https://github.com/idoyo7/lxcfs-admission-webhook.git
 cd lxcfs-admission-webhook/deploy
@@ -227,14 +258,23 @@ kubectl get pod lxcfs-check -o jsonpath='{.metadata.annotations.mutating\.lxcfs-
 
 ## Uninstall
 
+Mirror the install method:
+
 ```sh
-cd deploy
-./uninstall.sh
+# Helm
+helm uninstall lxcfs-admission-webhook -n lxcfs
+
+# ArgoCD
+kubectl delete application lxcfs-admission-webhook -n argocd
+# (with finalizers, ArgoCD prunes the workload first)
+
+# install.sh
+cd deploy && ./uninstall.sh
 ```
 
-Removes the MutatingWebhookConfiguration, Deployment, Service, LXCFS
-DaemonSet, the cert-manager Issuer/Certificate pair, and the Secrets
-they own. The namespace itself is left in place.
+Each path removes the MutatingWebhookConfiguration, Deployment,
+Service, LXCFS DaemonSet, the cert-manager Issuer/Certificate pair,
+and the Secrets they own. The namespace itself is left in place.
 
 ---
 

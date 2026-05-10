@@ -148,6 +148,30 @@ kubectl -n cert-manager wait --for=condition=Available deployment --all --timeou
 
 ## 설치
 
+세 가지 방식 중 본인 워크플로우에 맞는 걸 고르면 됨.
+
+### 1. Helm + GHCR — 권장
+
+차트는 매 릴리스마다 GHCR에 OCI artifact로 publish됨. Helm 3.8+ 부터 OCI를 native 지원:
+
+```sh
+helm install lxcfs-admission-webhook \
+  oci://ghcr.io/idoyo7/charts/lxcfs-admission-webhook \
+  --version 0.1.0 \
+  --namespace lxcfs --create-namespace
+```
+
+값 override는 `--set` 또는 `--values custom.yaml`. 전체 스키마는
+[`charts/lxcfs-admission-webhook/values.yaml`](charts/lxcfs-admission-webhook/values.yaml) 참고.
+
+### 2. ArgoCD — GitOps 환경 권장
+
+[`examples/argocd/application-oci.yaml`](examples/argocd/application-oci.yaml)을 본인 **GitOps 레포**에 복사해서 쓰면 됨 (이 레포에 적용하면 안 됨 — GitOps 원칙). ArgoCD가 OCI 레지스트리에서 차트를 받아 sync. 자세한 패턴/주의사항은 [`examples/argocd/README.md`](examples/argocd/README.md).
+
+### 3. install.sh — Helm 없이 최소 설치
+
+Helm/ArgoCD 가져오기 부담스러운 빠른 클러스터용:
+
 ```sh
 git clone https://github.com/idoyo7/lxcfs-admission-webhook.git
 cd lxcfs-admission-webhook/deploy
@@ -217,12 +241,21 @@ kubectl get pod lxcfs-check -o jsonpath='{.metadata.annotations.mutating\.lxcfs-
 
 ## 제거
 
+설치한 방식에 맞춰서:
+
 ```sh
-cd deploy
-./uninstall.sh
+# Helm
+helm uninstall lxcfs-admission-webhook -n lxcfs
+
+# ArgoCD
+kubectl delete application lxcfs-admission-webhook -n argocd
+# (finalizer가 워크로드 먼저 prune)
+
+# install.sh
+cd deploy && ./uninstall.sh
 ```
 
-MutatingWebhookConfiguration · Deployment · Service · LXCFS DaemonSet · cert-manager Issuer/Certificate 쌍 · 그들이 만든 Secret까지 같이 지운다. namespace 자체는 남긴다.
+어느 방식이든 MutatingWebhookConfiguration · Deployment · Service · LXCFS DaemonSet · cert-manager Issuer/Certificate 쌍 · 그들이 만든 Secret까지 같이 지운다. namespace 자체는 남긴다.
 
 ---
 
