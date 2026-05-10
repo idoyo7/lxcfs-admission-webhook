@@ -1,0 +1,101 @@
+name: Publish Helm chart
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'charts/**'
+      - '.github/workflows/chart-publish.yml'
+    tags:
+      - 'chart-v*.*.*'
+  pull_request:
+    paths:
+      - 'charts/**'
+      - '.github/workflows/chart-publish.yml'
+  workflow_dispatch:
+
+# After the first publish, set the chart's GHCR package visibility to
+# "Public" once via the GitHub Packages UI (or via:
+#   gh api -X PATCH /user/packages/container/charts%2Flxcfs-admission-webhook/visibility -f visibility=public
+# ) so unauthenticated `helm pull oci://...` works.
+
+env:
+  REGISTRY: ghcr.io
+  CHART_PATH: charts/lxcfs-admission-webhook
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: helm lint
+        run: helm lint ${{ env.CHART_PATH }}
+
+      - name: helm template (smoke render)
+        run: |
+          helm template ci ${{ env.CHART_PATH }} --namespace lxcfs > /tmp/rendered.yaml
+          echo "Rendered $(grep -c '^kind:' /tmp/rendered.yaml) resources, $(wc -l < /tmp/rendered.yaml) lines"
+
+      - name: kubeconform validate
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /tmp kubeconform
+          /tmp/kubeconform -strict -ignore-missing-schemas \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{ .Group }}/{{ .ResourceKind }}_{{ .ResourceAPIVersion }}.json' \
+            /tmp/rendered.yaml
+
+  publish:
+    needs: lint
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to ${{ env.REGISTRY }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Resolve chart version
+        id: chartver
+        run: |
+          version=$(helm show chart ${{ env.CHART_PATH }} | awk '/^version:/ {print $2}')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved chart version: ${version}"
+
+      - name: Package chart
+        run: |
+          mkdir -p /tmp/chartout
+          helm package ${{ env.CHART_PATH }} -d /tmp/chartout
+
+      - name: Push chart to OCI
+        id: push
+        run: |
+          out=$(helm push "/tmp/chartout/lxcfs-admission-webhook-${{ steps.chartver.outputs.version }}.tgz" \
+            "oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts" 2>&1 | tee /dev/stderr)
+          digest=$(echo "$out" | awk '/Digest:/ {print $2}')
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign chart with cosign
+        if: steps.push.outputs.digest != ''
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/lxcfs-admission-webhook@${{ steps.push.outputs.digest }}"
