@@ -285,9 +285,11 @@ func TestWebhookServerServe(t *testing.T) {
 func TestWebhookServerMutate(t *testing.T) {
 	whsvr := NewWebhookServer()
 
-	exceptSkipJsonPatch := "{\"op\":\"add\",\"path\":\"/metadata/annotations\",\"value\":{\"mutating.lxcfs-admission-webhook.io/status\":\"skip\"}}"
-	exceptMutatedJsonPatch := "{\"op\":\"add\",\"path\":\"/metadata/annotations\",\"value\":{\"mutating.lxcfs-admission-webhook.io/status\":\"mutated\"}}"
-	exceptConflictJsonPatch := "{\"op\":\"add\",\"path\":\"/metadata/annotations\",\"value\":{\"mutating.lxcfs-admission-webhook.io/status\":\"conflict\"}}"
+	// patchAnnotation emits per-key add operations whose Path follows
+	// RFC 6901 JSON Pointer escaping ('/' -> '~1').
+	exceptSkipJsonPatch := "{\"op\":\"add\",\"path\":\"/metadata/annotations/mutating.lxcfs-admission-webhook.io~1status\",\"value\":\"skip\"}"
+	exceptMutatedJsonPatch := "{\"op\":\"add\",\"path\":\"/metadata/annotations/mutating.lxcfs-admission-webhook.io~1status\",\"value\":\"mutated\"}"
+	exceptConflictJsonPatch := "{\"op\":\"add\",\"path\":\"/metadata/annotations/mutating.lxcfs-admission-webhook.io~1status\",\"value\":\"conflict\"}"
 	exceptErrorMsg := "json: cannot unmarshal array into Go value of type v1.Pod"
 
 	admissionReviewExample := GetAdmissionReviewExample()

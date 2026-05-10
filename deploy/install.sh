@@ -25,7 +25,7 @@ Options:
   --wh-image          webhook image
                       (default: ghcr.io/idoyo7/lxcfs-admission-webhook:latest)
   --lxcfs-image       lxcfs image
-                      (default: ghcr.io/idoyo7/lxcfs:6.0.1-r1)
+                      (default: ghcr.io/idoyo7/lxcfs:6.0.1-r0)
 
   --create-cert-only  generate a self-signed test cert in ./certs using
                       openssl (used by 'make test'; not the production
@@ -153,7 +153,7 @@ main() {
   CREATE_CERT_ONLY=false
 
   : "${WH_IMAGE:=ghcr.io/idoyo7/lxcfs-admission-webhook:latest}"
-  : "${LXCFS_IMAGE:=ghcr.io/idoyo7/lxcfs:6.0.1-r1}"
+  : "${LXCFS_IMAGE:=ghcr.io/idoyo7/lxcfs:6.0.1-r0}"
 
   while [[ $# -gt 0 ]]; do
     case $1 in
