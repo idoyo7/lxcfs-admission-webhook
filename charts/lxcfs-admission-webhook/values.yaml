@@ -1,0 +1,94 @@
+# -- Override the chart name
+nameOverride: ""
+# -- Override the fully qualified app name
+fullnameOverride: ""
+
+# Webhook configuration
+webhook:
+  image:
+    repository: ghcr.io/idoyo7/lxcfs-admission-webhook
+    # -- Image tag. Defaults to chart appVersion.
+    tag: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  replicas: 2
+  port: 8443
+  args:
+    - -tlsCertFile=/etc/webhook/certs/tls.crt
+    - -tlsKeyFile=/etc/webhook/certs/tls.key
+    - -alsologtostderr
+    - -v=4
+  resources:
+    limits:
+      cpu: "1"
+      memory: 1Gi
+    requests: {}
+  podAnnotations:
+    mutating.lxcfs-admission-webhook.io/enable: "false"
+  # -- Affinity / nodeSelector / tolerations applied to the webhook Deployment
+  affinity: {}
+  nodeSelector: {}
+  tolerations: []
+
+# LXCFS DaemonSet configuration
+lxcfs:
+  image:
+    repository: ghcr.io/idoyo7/lxcfs
+    tag: 6.0.1-r0
+    pullPolicy: Always
+  resources:
+    limits:
+      cpu: 500m
+      memory: 128Mi
+    requests: {}
+  # -- Host path used to expose LXCFS state to other Pods on the node
+  hostPath: /var/lib/lxc
+  podAnnotations:
+    mutating.lxcfs-admission-webhook.io/enable: "false"
+  # -- Tolerations applied to the LXCFS DaemonSet (default tolerates control-plane)
+  tolerations:
+    - key: node-role.kubernetes.io/master
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/control-plane
+      effect: NoSchedule
+  # -- Node affinity restricting LXCFS to linux nodes
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/os
+                operator: In
+                values:
+                  - linux
+  nodeSelector: {}
+
+# cert-manager managed serving certificate
+certificate:
+  ca:
+    # -- Lifetime of the local CA cert (10y default)
+    duration: 87600h
+    privateKey:
+      algorithm: RSA
+      size: 4096
+  serving:
+    # -- Lifetime of the webhook serving cert (1y default)
+    duration: 8760h
+    # -- Renew this long before expiry (30d default)
+    renewBefore: 720h
+    privateKey:
+      algorithm: RSA
+      size: 2048
+
+# MutatingWebhookConfiguration
+mutatingWebhook:
+  failurePolicy: Ignore
+  timeoutSeconds: 5
+  sideEffects: None
+  reinvocationPolicy: Never
+  # -- Only mutate Pods in namespaces carrying this label
+  namespaceSelector:
+    matchLabels:
+      lxcfs-admission-webhook: enabled
+  # -- Optional objectSelector for finer control
+  objectSelector: {}

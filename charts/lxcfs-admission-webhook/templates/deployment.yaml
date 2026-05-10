@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lxcfs-admission-webhook.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
+    app: {{ include "lxcfs-admission-webhook.fullname" . }}
+spec:
+  replicas: {{ .Values.webhook.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "lxcfs-admission-webhook.fullname" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "lxcfs-admission-webhook.fullname" . }}
+      annotations:
+        {{- toYaml .Values.webhook.podAnnotations | nindent 8 }}
+    spec:
+      {{- with .Values.webhook.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: lxcfs-admission-webhook
+          image: {{ include "lxcfs-admission-webhook.image" (dict "image" .Values.webhook.image "defaultTag" .Chart.AppVersion) }}
+          imagePullPolicy: {{ .Values.webhook.image.pullPolicy }}
+          args:
+            {{- toYaml .Values.webhook.args | nindent 12 }}
+          livenessProbe:
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            httpGet:
+              port: {{ .Values.webhook.port }}
+              path: /ping
+              scheme: HTTPS
+          readinessProbe:
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            httpGet:
+              port: {{ .Values.webhook.port }}
+              path: /ping
+              scheme: HTTPS
+          resources:
+            {{- toYaml .Values.webhook.resources | nindent 12 }}
+          volumeMounts:
+            - name: webhook-certs
+              mountPath: /etc/webhook/certs
+              readOnly: true
+      volumes:
+        - name: webhook-certs
+          secret:
+            secretName: {{ include "lxcfs-admission-webhook.fullname" . }}

@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "lxcfs-admission-webhook.lxcfsFullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
+    app: {{ include "lxcfs-admission-webhook.lxcfsFullname" . }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "lxcfs-admission-webhook.lxcfsFullname" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "lxcfs-admission-webhook.lxcfsFullname" . }}
+      annotations:
+        {{- toYaml .Values.lxcfs.podAnnotations | nindent 8 }}
+    spec:
+      hostPID: true
+      {{- with .Values.lxcfs.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.lxcfs.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.lxcfs.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: lxcfs
+          image: {{ include "lxcfs-admission-webhook.image" (dict "image" .Values.lxcfs.image "defaultTag" .Values.lxcfs.image.tag) }}
+          imagePullPolicy: {{ .Values.lxcfs.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --remount
+            preStop:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --umount
+          resources:
+            {{- toYaml .Values.lxcfs.resources | nindent 12 }}
+          volumeMounts:
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+            - name: lxcfs
+              mountPath: /var/lib/lxc
+              mountPropagation: Bidirectional
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+        - name: lxcfs
+          hostPath:
+            path: {{ .Values.lxcfs.hostPath }}
+            type: DirectoryOrCreate

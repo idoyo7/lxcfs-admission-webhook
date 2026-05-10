@@ -1,0 +1,26 @@
+apiVersion: v2
+name: lxcfs-admission-webhook
+description: A Kubernetes admission webhook that auto-mounts LXCFS-virtualized /proc and /sys files into Pods so containers see cgroup-aware CPU/memory values.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/idoyo7/lxcfs-admission-webhook
+sources:
+  - https://github.com/idoyo7/lxcfs-admission-webhook
+maintainers:
+  - name: idoyo7
+    email: idoyo7@gmail.com
+keywords:
+  - lxcfs
+  - admission-webhook
+  - cgroup
+  - jvm
+  - container
+  - resource-isolation
+annotations:
+  artifacthub.io/category: networking
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/recommendations: |
+    - url: https://artifacthub.io/packages/helm/cert-manager/cert-manager
+icon: https://linuxcontainers.org/static/img/containers.small.png

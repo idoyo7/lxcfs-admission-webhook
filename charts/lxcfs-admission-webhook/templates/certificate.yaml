@@ -1,0 +1,70 @@
+---
+# Self-signed Issuer that bootstraps the local CA.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "lxcfs-admission-webhook.fullname" . }}-selfsigned
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+# Local CA certificate, signed by the self-signed issuer above.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "lxcfs-admission-webhook.fullname" . }}-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: {{ include "lxcfs-admission-webhook.fullname" . }}-ca
+  secretName: {{ include "lxcfs-admission-webhook.fullname" . }}-ca
+  duration: {{ .Values.certificate.ca.duration }}
+  privateKey:
+    algorithm: {{ .Values.certificate.ca.privateKey.algorithm }}
+    size: {{ .Values.certificate.ca.privateKey.size }}
+    rotationPolicy: Always
+  issuerRef:
+    name: {{ include "lxcfs-admission-webhook.fullname" . }}-selfsigned
+    kind: Issuer
+---
+# CA Issuer that issues the webhook serving certificate.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "lxcfs-admission-webhook.fullname" . }}-ca-issuer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ include "lxcfs-admission-webhook.fullname" . }}-ca
+---
+# Webhook serving certificate. The Secret it produces is what the
+# admission webhook Deployment mounts at /etc/webhook/certs.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "lxcfs-admission-webhook.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "lxcfs-admission-webhook.fullname" . }}
+  duration: {{ .Values.certificate.serving.duration }}
+  renewBefore: {{ .Values.certificate.serving.renewBefore }}
+  privateKey:
+    algorithm: {{ .Values.certificate.serving.privateKey.algorithm }}
+    size: {{ .Values.certificate.serving.privateKey.size }}
+    rotationPolicy: Always
+  dnsNames:
+    - {{ include "lxcfs-admission-webhook.fullname" . }}
+    - {{ include "lxcfs-admission-webhook.fullname" . }}.{{ .Release.Namespace }}
+    - {{ include "lxcfs-admission-webhook.fullname" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "lxcfs-admission-webhook.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    name: {{ include "lxcfs-admission-webhook.fullname" . }}-ca-issuer
+    kind: Issuer

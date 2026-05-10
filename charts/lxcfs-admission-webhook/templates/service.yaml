@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lxcfs-admission-webhook.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
+    app: {{ include "lxcfs-admission-webhook.fullname" . }}
+spec:
+  ports:
+    - port: 443
+      targetPort: {{ .Values.webhook.port }}
+  selector:
+    app: {{ include "lxcfs-admission-webhook.fullname" . }}

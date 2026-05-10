@@ -1,0 +1,49 @@
+Thank you for installing {{ .Chart.Name }} {{ .Chart.Version }}.
+
+=== Prerequisites ===
+
+cert-manager v1.x must be installed and running in your cluster before the
+webhook can start. Install it if you haven't already:
+
+  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+
+LXCFS also requires the "fuse3" kernel module on every node where the DaemonSet
+runs. Ensure fuse3 is installed on your nodes before proceeding.
+
+=== Enable a namespace ===
+
+The webhook only mutates Pods in namespaces labelled:
+
+  lxcfs-admission-webhook: enabled
+
+Label a namespace to opt in:
+
+  kubectl label namespace <your-namespace> lxcfs-admission-webhook=enabled
+
+=== Opt out a specific Pod ===
+
+Add the following annotation to any Pod spec to skip mutation:
+
+  mutating.lxcfs-admission-webhook.io/enable: "false"
+
+=== Verify the installation ===
+
+1. Wait for the serving certificate to be issued:
+
+   kubectl -n {{ .Release.Namespace }} wait --for=condition=Ready \
+     certificate.cert-manager.io/{{ include "lxcfs-admission-webhook.fullname" . }} \
+     --timeout=120s
+
+2. Run a test Pod in an opted-in namespace and confirm /proc/cpuinfo reflects
+   cgroup-limited CPU count (example from the project README):
+
+   kubectl run lxcfs-test --image=ubuntu:22.04 --rm -it \
+     --namespace=<opted-in-namespace> \
+     -- bash -c "nproc && cat /proc/meminfo | grep MemTotal"
+
+=== Webhook deployment ===
+
+  Release name : {{ .Release.Name }}
+  Namespace    : {{ .Release.Namespace }}
+  Webhook svc  : {{ include "lxcfs-admission-webhook.fullname" . }}.{{ .Release.Namespace }}.svc
+  Cert secret  : {{ include "lxcfs-admission-webhook.fullname" . }}  (managed by cert-manager)
