@@ -134,7 +134,7 @@ Useful overrides:
 | `--daemonset` | `lxcfs-ds` |
 | `--mutating` | `lxcfs-admission-webhook` |
 | `--wh-image` / `WH_IMAGE` | `ghcr.io/idoyo7/lxcfs-admission-webhook:latest` |
-| `--lxcfs-image` / `LXCFS_IMAGE` | `ghcr.io/idoyo7/lxcfs:6.0.1-r0` |
+| `--lxcfs-image` / `LXCFS_IMAGE` | `ghcr.io/idoyo7/lxcfs:6.0.1-r1` |
 
 ---
 
@@ -202,7 +202,7 @@ The Helm chart exposes the main operational knobs under [`values.yaml`](charts/l
 | `webhook.replicas` | `2` |
 | `webhook.port` | `8443` |
 | `lxcfs.image.repository` | `ghcr.io/idoyo7/lxcfs` |
-| `lxcfs.image.tag` | `6.0.1-r0` |
+| `lxcfs.image.tag` | `6.0.1-r1` |
 | `lxcfs.hostPath` | `/var/lib/lxc` |
 | `mutatingWebhook.namespaceSelector.matchLabels.lxcfs-admission-webhook` | `enabled` |
 | `mutatingWebhook.timeoutSeconds` | `5` |

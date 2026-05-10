@@ -16,24 +16,22 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Track the lxcfs apk version pinned in lxcfs-image/.env against Alpine 3.21 community.",
+      "description": "Track the lxcfs apk version pinned in lxcfs-image/.env against Alpine edge community.",
       "fileMatch": ["^lxcfs-image/\\.env$"],
       "matchStrings": [
         "LXCFS_VERSION=(?<currentValue>[^\\s]+)"
       ],
       "datasourceTemplate": "repology",
-      "depNameTemplate": "alpine_3_21/lxcfs",
+      "depNameTemplate": "alpine_edge/lxcfs",
       "versioningTemplate": "loose"
     },
     {
       "customType": "regex",
-      "description": "Track the lxcfs image tag default in the chart's values.yaml.",
+      "description": "Track values.yaml tags that carry an inline `# renovate: ...` marker.",
       "fileMatch": ["^charts/lxcfs-admission-webhook/values\\.yaml$"],
       "matchStrings": [
-        "repository:\\s+ghcr\\.io/idoyo7/lxcfs\\s+#?[^\\n]*\\n\\s+tag:\\s+(?<currentValue>[^\\s#]+)"
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)\\s*\\n\\s+tag:\\s+(?<currentValue>[^\\s#]+)"
       ],
-      "datasourceTemplate": "repology",
-      "depNameTemplate": "alpine_3_21/lxcfs",
       "versioningTemplate": "loose"
     }
   ],
@@ -42,9 +40,9 @@
     {
       "description": "Group every Alpine lxcfs bump (env + chart values) into one PR.",
       "matchDatasources": ["repology"],
-      "matchPackageNames": ["alpine_3_21/lxcfs"],
+      "matchPackageNames": ["alpine_edge/lxcfs"],
       "groupName": "alpine lxcfs package",
-      "commitMessageTopic": "lxcfs (alpine 3.21 community)",
+      "commitMessageTopic": "lxcfs (alpine edge community)",
       "addLabels": ["lxcfs-version"]
     },
     {

@@ -1,4 +1,4 @@
-FROM alpine:3.21
+FROM alpine:edge
 
 LABEL maintainer="idoyo7 <idoyo7@gmail.com>"
 LABEL org.opencontainers.image.source="https://github.com/idoyo7/lxcfs-admission-webhook"
@@ -6,12 +6,12 @@ LABEL org.opencontainers.image.source="https://github.com/idoyo7/lxcfs-admission
 ADD . /lxcfs
 
 
-ARG LXCFS_VERSION=6.0.1-r0
+ARG LXCFS_VERSION=6.0.1-r1
 ENV LXCFS_VERSION=${LXCFS_VERSION}
 
-# lxcfs lives in alpine:3.21's community repo (already enabled). The
-# edge override is intentionally dropped: edge's lxcfs builds against
-# libfuse3.so.4, which alpine:3.21 main does not provide.
+# alpine:edge so lxcfs and its libfuse3 ABI track upstream together.
+# When LXCFS 7.x lands in edge/community Renovate will open a single
+# PR bumping LXCFS_VERSION here and the chart's default tag.
 RUN chmod +x /lxcfs/entrypoint.sh && \
     apk add --no-cache dumb-init bash lxcfs=${LXCFS_VERSION}
 
