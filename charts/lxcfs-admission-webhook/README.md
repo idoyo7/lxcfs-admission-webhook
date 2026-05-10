@@ -110,6 +110,13 @@ LXCFS DaemonSet (every linux node)
   └─ mounts /var/lib/lxc on the host via nsenter
 ```
 
+## Upgrades
+
+- See [MIGRATION.md](MIGRATION.md) for the LXCFS 7.x readiness path
+  and the values-only flip that lands the new release.
+- All chart resources are release-named, so rollbacks are
+  `helm rollback` or an Argo CD `targetRevision` change away.
+
 ## Source
 
 - GitHub: <https://github.com/idoyo7/lxcfs-admission-webhook>
