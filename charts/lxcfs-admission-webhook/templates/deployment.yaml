@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "lxcfs-admission-webhook.fullname" . }}
+  name: {{ include "lxcfs-admission-webhook.webhookFullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
-    app: {{ include "lxcfs-admission-webhook.fullname" . }}
+    app: {{ include "lxcfs-admission-webhook.webhookFullname" . }}
 spec:
   replicas: {{ .Values.webhook.replicas }}
   selector:
     matchLabels:
-      app: {{ include "lxcfs-admission-webhook.fullname" . }}
+      app: {{ include "lxcfs-admission-webhook.webhookFullname" . }}
   template:
     metadata:
       labels:
-        app: {{ include "lxcfs-admission-webhook.fullname" . }}
+        app: {{ include "lxcfs-admission-webhook.webhookFullname" . }}
       annotations:
         {{- toYaml .Values.webhook.podAnnotations | nindent 8 }}
     spec:
@@ -63,4 +63,4 @@ spec:
       volumes:
         - name: webhook-certs
           secret:
-            secretName: {{ include "lxcfs-admission-webhook.fullname" . }}
+            secretName: {{ include "lxcfs-admission-webhook.webhookFullname" . }}

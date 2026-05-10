@@ -1,14 +1,14 @@
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  name: {{ include "lxcfs-admission-webhook.fullname" . }}
+  name: {{ include "lxcfs-admission-webhook.webhookFullname" . }}
   labels:
     {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
-    app: {{ include "lxcfs-admission-webhook.fullname" . }}
+    app: {{ include "lxcfs-admission-webhook.webhookFullname" . }}
   annotations:
     # cert-manager injects the CA bundle from the Secret produced by
     # the matching Certificate resource. Format: <namespace>/<certificate-name>.
-    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "lxcfs-admission-webhook.fullname" . }}
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "lxcfs-admission-webhook.webhookFullname" . }}
 webhooks:
   - name: mutating.lxcfs-admission-webhook.io
     admissionReviewVersions:
@@ -19,7 +19,7 @@ webhooks:
     reinvocationPolicy: {{ .Values.mutatingWebhook.reinvocationPolicy }}
     clientConfig:
       service:
-        name: {{ include "lxcfs-admission-webhook.fullname" . }}
+        name: {{ include "lxcfs-admission-webhook.webhookFullname" . }}
         namespace: {{ .Release.Namespace }}
         path: /mutate
       # caBundle is populated automatically by cert-manager via the

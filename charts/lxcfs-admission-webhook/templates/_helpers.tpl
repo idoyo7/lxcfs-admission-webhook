@@ -51,17 +51,19 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Full name for webhook resources (same as base fullname).
+Full name for webhook (controller) resources: {release}-{webhook.componentName}.
 */}}
 {{- define "lxcfs-admission-webhook.webhookFullname" -}}
-{{- include "lxcfs-admission-webhook.fullname" . }}
+{{- $component := default "controller" .Values.webhook.componentName }}
+{{- printf "%s-%s" .Release.Name $component | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
-Full name for the LXCFS DaemonSet: {fullname}-lxcfs.
+Full name for the LXCFS DaemonSet: {release}-{lxcfs.componentName}.
 */}}
 {{- define "lxcfs-admission-webhook.lxcfsFullname" -}}
-{{- printf "%s-lxcfs" (include "lxcfs-admission-webhook.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- $component := default "daemonset" .Values.lxcfs.componentName }}
+{{- printf "%s-%s" .Release.Name $component | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
