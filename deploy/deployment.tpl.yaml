@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: lxcfs-admission-webhook
-          image: montkim9/lxcfs-admission-webhook:0.1.7
+          image: ${WH_IMAGE}
           args:
             - -tlsCertFile=/etc/webhook/certs/tls.crt
             - -tlsKeyFile=/etc/webhook/certs/tls.key

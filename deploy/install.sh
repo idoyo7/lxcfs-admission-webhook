@@ -111,6 +111,8 @@ create_k8s_resources() {
   export WH_SECRET
   export MUTATING_WH_CONFIG
   export LXCFS_DS
+  export WH_IMAGE
+  export LXCFS_IMAGE
 
   # 1 Deploy lxcfs daemonset
   envsubst <"$PWD"/lxcfs-daemonset.tpl.yaml | kubectl create -n "${NAMESPACE}" -o yaml --dry-run=client -f - | kubectl -n "${NAMESPACE}" apply -f -
@@ -143,6 +145,10 @@ main() {
   MUTATING_WH_CONFIG=lxcfs-admission-webhook
   LXCFS_DS=lxcfs-ds
   CREATE_CERT_ONLY=false
+
+  # default container images; override via env or CLI flags
+  : "${WH_IMAGE:=ghcr.io/idoyo7/lxcfs-admission-webhook:latest}"
+  : "${LXCFS_IMAGE:=ghcr.io/idoyo7/lxcfs:6.0.1-r1}"
 
   if [[ $# -ge 1 ]]; then
     case $1 in

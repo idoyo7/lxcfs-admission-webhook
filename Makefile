@@ -22,10 +22,10 @@ ifneq ($(NEED_GO_PKG),)
 endif
 LDFLAGS := "-X 'main.Version=$(VERSION)' -X 'main.GoVersion=$(GO_VERSION)' -X 'main.GitCommit=$(COMMIT_ID)' -X 'main.BuildTime=$(BUILD_TIME)'"
 
-# Docker related variables.
-DOCKER_USER := <YOUR_DOCKER_USERNAME>
-DOCKER_IMAGE_WH := $(DOCKER_USER)/$(PROJECT_NAME)
-DOCKER_IMAGE_LXCFS := $(DOCKER_USER)/lxcfs
+# Docker related variables. Override DOCKER_REGISTRY to publish elsewhere.
+DOCKER_REGISTRY ?= ghcr.io/idoyo7
+DOCKER_IMAGE_WH := $(DOCKER_REGISTRY)/$(PROJECT_NAME)
+DOCKER_IMAGE_LXCFS := $(DOCKER_REGISTRY)/lxcfs
 DOCKER_TAG_LXCFS := 6.0.1-r1
 
 .PHONY: all dep lint vet test test-coverage build clean start-wh build-image-wh push-image-wh build-image-lxcfs push-image-lxcfs
