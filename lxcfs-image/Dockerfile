@@ -5,7 +5,7 @@ LABEL maintainer="ymping <ympiing@gmail.com>"
 ADD . /lxcfs
 
 
-ARG LXCFS_VERSION=6.0.1-r0
+ARG LXCFS_VERSION=6.0.1-r1
 ENV LXCFS_VERSION=${LXCFS_VERSION}
 
 RUN chmod +x /lxcfs/entrypoint.sh && \
