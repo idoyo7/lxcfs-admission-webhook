@@ -1,0 +1,62 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard"
+  ],
+  "labels": ["dependencies"],
+  "timezone": "Asia/Seoul",
+  "schedule": [
+    "before 06:00 on monday"
+  ],
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 6,
+
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the lxcfs apk version pinned in lxcfs-image/.env against Alpine 3.21 community.",
+      "fileMatch": ["^lxcfs-image/\\.env$"],
+      "matchStrings": [
+        "LXCFS_VERSION=(?<currentValue>[^\\s]+)"
+      ],
+      "datasourceTemplate": "repology",
+      "depNameTemplate": "alpine_3_21/lxcfs",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the lxcfs image tag default in the chart's values.yaml.",
+      "fileMatch": ["^charts/lxcfs-admission-webhook/values\\.yaml$"],
+      "matchStrings": [
+        "repository:\\s+ghcr\\.io/idoyo7/lxcfs\\s+#?[^\\n]*\\n\\s+tag:\\s+(?<currentValue>[^\\s#]+)"
+      ],
+      "datasourceTemplate": "repology",
+      "depNameTemplate": "alpine_3_21/lxcfs",
+      "versioningTemplate": "loose"
+    }
+  ],
+
+  "packageRules": [
+    {
+      "description": "Group every Alpine lxcfs bump (env + chart values) into one PR.",
+      "matchDatasources": ["repology"],
+      "matchPackageNames": ["alpine_3_21/lxcfs"],
+      "groupName": "alpine lxcfs package",
+      "commitMessageTopic": "lxcfs (alpine 3.21 community)",
+      "addLabels": ["lxcfs-version"]
+    },
+    {
+      "description": "Pin GitHub Actions to digests once renovate proposes them.",
+      "matchManagers": ["github-actions"],
+      "pinDigests": false
+    },
+    {
+      "description": "Group all k8s.io/* module bumps together.",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["/^k8s\\.io//"],
+      "groupName": "kubernetes go modules"
+    }
+  ]
+}
