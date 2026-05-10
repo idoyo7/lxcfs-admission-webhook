@@ -4,6 +4,10 @@ metadata:
   name: ${MUTATING_WH_CONFIG}
   labels:
     app: ${MUTATING_WH_CONFIG}
+  annotations:
+    # cert-manager injects the CA bundle from the Secret produced by
+    # the matching Certificate resource. Format: <namespace>/<certificate-name>.
+    cert-manager.io/inject-ca-from: ${NAMESPACE}/${WH_DEP}
 webhooks:
 - name: mutating.lxcfs-admission-webhook.io
   admissionReviewVersions: [ "v1" ]
@@ -15,7 +19,8 @@ webhooks:
       name: ${WH_SVC}
       namespace: ${NAMESPACE}
       path: "/mutate"
-    caBundle: ${CA_BUNDLE}
+    # caBundle is populated automatically by cert-manager via the
+    # cert-manager.io/inject-ca-from annotation above.
   rules:
   - apiGroups: [ "" ]
     apiVersions: [ "v1" ]

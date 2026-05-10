@@ -4,60 +4,104 @@ set -eo pipefail
 
 usage() {
   cat <<EOF
-usage: ${0} [advanced options]
+usage: ${0} [options]
 
-advanced options:
-defined resources name:
-  --namespace         kubernetes namespace where webhook service, lxcfs daemonset and secret reside, default: lxcfs
-  --deployment        webhook deployment name, default: lxcfs-admission-webhook
-  --service           LXCFS admission webhook service name, default: lxcfs-admission-webhook
-  --secret            LXCFS admission webhook mutating secret name, default: lxcfs-admission-webhook
-  --daemonset         LXCFS daemonset name, default: lxcfs-ds
-  --mutating          mutating admission name, default: lxcfs-admission-webhook
+Install the LXCFS admission webhook and DaemonSet using cert-manager
+to issue and inject the webhook serving certificate.
 
-  --create-cert-only  generate a self-signed certificate in current directory
+Required:
+  cert-manager v1.x must already be installed in the cluster
+  (https://cert-manager.io/docs/installation/).
 
+Options:
+  --namespace         namespace to install into (default: lxcfs)
+  --deployment        webhook deployment name (default: lxcfs-admission-webhook)
+  --service           webhook service name (default: lxcfs-admission-webhook)
+  --secret            Secret name cert-manager writes the cert into
+                      (default: lxcfs-admission-webhook)
+  --daemonset         LXCFS DaemonSet name (default: lxcfs-ds)
+  --mutating          MutatingWebhookConfiguration name
+                      (default: lxcfs-admission-webhook)
+  --wh-image          webhook image
+                      (default: ghcr.io/idoyo7/lxcfs-admission-webhook:latest)
+  --lxcfs-image       lxcfs image
+                      (default: ghcr.io/idoyo7/lxcfs:6.0.1-r1)
+
+  --create-cert-only  generate a self-signed test cert in ./certs using
+                      openssl (used by 'make test'; not the production
+                      install path)
 EOF
-}
-
-help() {
-  cat <<EOF
-By create lxcfs daemonset and k8s dynamic admission webhook
-to help see right container's limitations in the container.
-
-This script will:
-1. create deployment of lxcfs daemonset
-2. create admission webhook cert stored in a k8s secret
-3. create deployment of dynamic admission webhook for patch lxcfs volume for container
-4. create k8s MutatingWebhookConfiguration
-
-about lxcfs:
-https://linuxcontainers.org/lxcfs/introduction/
-
-about k8s dynamic admission webhook:
-https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/
-
-how to generate certificate:
-https://kubernetes.io/docs/tasks/administer-cluster/certificates/#openssl
-
-EOF
-
-  usage
 }
 
 pre_check() {
-  if ! kubectl cluster-info; then
-    echo "Can't connect to kubernetes control plane"
+  if ! command -v kubectl >/dev/null; then
+    echo "kubectl not found in PATH" >&2
+    exit 1
+  fi
+  if ! kubectl cluster-info >/dev/null 2>&1; then
+    echo "Can't reach the Kubernetes control plane" >&2
     exit 101
+  fi
+  if ! kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
+    cat >&2 <<EOF
+cert-manager CRDs not found.
+Install cert-manager v1.x first, e.g.:
+  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+EOF
+    exit 102
+  fi
+  if ! command -v envsubst >/dev/null; then
+    echo "envsubst not found in PATH (install gettext)" >&2
+    exit 1
   fi
 }
 
-create_self_signed_cert() {
-  # gen certs doc: https://kubernetes.io/docs/tasks/administer-cluster/certificates/#openssl
-  echo "Creating certs in directory: ${CERT_DIR} "
+apply_template() {
+  local file=$1
+  local namespaced=${2:-true}
+  if [[ "$namespaced" == "true" ]]; then
+    envsubst <"$PWD/$file" \
+      | kubectl create -n "${NAMESPACE}" -o yaml --dry-run=client -f - \
+      | kubectl -n "${NAMESPACE}" apply -f -
+  else
+    envsubst <"$PWD/$file" \
+      | kubectl create -o yaml --dry-run=client -f - \
+      | kubectl apply -f -
+  fi
+}
 
-  local BITS=${BITS:-"2048"}
-  local DAYS=${DAYS:-"10950"} # 30 years
+create_k8s_resources() {
+  export NAMESPACE WH_DEP WH_SVC WH_SECRET MUTATING_WH_CONFIG LXCFS_DS \
+         WH_IMAGE LXCFS_IMAGE
+
+  kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 \
+    || kubectl create namespace "${NAMESPACE}"
+
+  # 1. cert-manager Issuer + Certificate (produces the webhook Secret).
+  apply_template certificate.tpl.yaml
+
+  # 2. LXCFS DaemonSet.
+  apply_template lxcfs-daemonset.tpl.yaml
+
+  # 3. Webhook Deployment + Service.
+  apply_template deployment.tpl.yaml
+  apply_template service.tpl.yaml
+
+  # 4. Wait until cert-manager has issued the serving cert; otherwise the
+  #    webhook pod will crash-loop on missing tls.crt.
+  echo "Waiting for cert-manager to issue ${WH_SECRET}..."
+  kubectl -n "${NAMESPACE}" wait --for=condition=Ready \
+    "certificate.cert-manager.io/${WH_DEP}" --timeout=120s
+
+  # 5. MutatingWebhookConfiguration (caBundle is injected by cert-manager
+  #    via the cert-manager.io/inject-ca-from annotation).
+  apply_template mutatingwebhook.tpl.yaml false
+}
+
+create_self_signed_cert() {
+  echo "Creating test certs in directory: ${CERT_DIR}"
+  local BITS=${BITS:-2048}
+  local DAYS=${DAYS:-10950}
   cat <<EOF >"${CERT_DIR}"/csr.conf
 [ req ]
 default_bits = ${BITS}
@@ -67,12 +111,7 @@ req_extensions = req_ext
 distinguished_name = dn
 
 [ dn ]
-C = CN
-ST = Sichuan
-L = Chengdu
-O = Kubernetes
-OU = Dynamic Admission Control
-CN=${WH_SVC}.${NAMESPACE}.svc
+CN = ${WH_SVC}.${NAMESPACE}.svc
 
 [ req_ext ]
 subjectAltName = @alt_names
@@ -90,54 +129,21 @@ basicConstraints = CA:FALSE
 keyUsage = nonRepudiation, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth, clientAuth
 subjectAltName = @alt_names
-
 EOF
 
-  # gen ca cert
-  openssl genrsa -out "${CERT_DIR}"/ca-key.pem "${BITS}"
-  openssl req -x509 -new -nodes -days "${DAYS}" -key "${CERT_DIR}"/ca-key.pem -subj "/CN=Kubernetes Admin" -out "${CERT_DIR}"/ca-cert.pem
-  # gen server cert
-  openssl genrsa -out "${CERT_DIR}"/server-key.pem "${BITS}"
-  openssl req -new -key "${CERT_DIR}"/server-key.pem -config "${CERT_DIR}"/csr.conf -out "${CERT_DIR}"/server.csr
-  openssl x509 -req -in "${CERT_DIR}"/server.csr -CA "${CERT_DIR}"/ca-cert.pem -CAkey "${CERT_DIR}"/ca-key.pem \
-    -CAcreateserial -days "${DAYS}" -extensions v3_ext -extfile "${CERT_DIR}"/csr.conf \
-    -out "${CERT_DIR}"/server-cert.pem
-}
-
-create_k8s_resources() {
-  export NAMESPACE
-  export WH_DEP
-  export WH_SVC
-  export WH_SECRET
-  export MUTATING_WH_CONFIG
-  export LXCFS_DS
-  export WH_IMAGE
-  export LXCFS_IMAGE
-
-  # 1 Deploy lxcfs daemonset
-  envsubst <"$PWD"/lxcfs-daemonset.tpl.yaml | kubectl create -n "${NAMESPACE}" -o yaml --dry-run=client -f - | kubectl -n "${NAMESPACE}" apply -f -
-
-  # 2 Create admission webhook cert
-  CERT_DIR=$(mktemp -d)
-  create_self_signed_cert
-  kubectl create secret generic "${WH_SECRET}" -n "${NAMESPACE}" \
-    --from-file=tls.key="${CERT_DIR}"/server-key.pem \
-    --from-file=tls.crt="${CERT_DIR}"/server-cert.pem \
-    --dry-run=client -o yaml |
-    kubectl -n "${NAMESPACE}" apply -f -
-
-  # 3 Deploy admission webhook
-  envsubst <"$PWD"/deployment.tpl.yaml | kubectl create -n "${NAMESPACE}" -o yaml --dry-run=client -f - | kubectl -n "${NAMESPACE}" apply -f -
-  envsubst <"$PWD"/service.tpl.yaml | kubectl create -n "${NAMESPACE}" -o yaml --dry-run=client -f - | kubectl -n "${NAMESPACE}" apply -f -
-
-  # 4 Create k8s MutatingWebhookConfiguration
-  CA_BUNDLE=$(base64 <"${CERT_DIR}"/ca-cert.pem | tr -d '\n')
-  export CA_BUNDLE
-  envsubst <"$PWD"/mutatingwebhook.tpl.yaml | kubectl create -o yaml --dry-run=client -f - | kubectl apply -f -
+  openssl genrsa -out "${CERT_DIR}/ca-key.pem" "${BITS}"
+  openssl req -x509 -new -nodes -days "${DAYS}" -key "${CERT_DIR}/ca-key.pem" \
+    -subj "/CN=lxcfs-admission-webhook-test-ca" -out "${CERT_DIR}/ca-cert.pem"
+  openssl genrsa -out "${CERT_DIR}/server-key.pem" "${BITS}"
+  openssl req -new -key "${CERT_DIR}/server-key.pem" -config "${CERT_DIR}/csr.conf" \
+    -out "${CERT_DIR}/server.csr"
+  openssl x509 -req -in "${CERT_DIR}/server.csr" -CA "${CERT_DIR}/ca-cert.pem" \
+    -CAkey "${CERT_DIR}/ca-key.pem" -CAcreateserial -days "${DAYS}" \
+    -extensions v3_ext -extfile "${CERT_DIR}/csr.conf" \
+    -out "${CERT_DIR}/server-cert.pem"
 }
 
 main() {
-  # set resources default name
   NAMESPACE=lxcfs
   WH_DEP=lxcfs-admission-webhook
   WH_SVC=lxcfs-admission-webhook
@@ -146,54 +152,26 @@ main() {
   LXCFS_DS=lxcfs-ds
   CREATE_CERT_ONLY=false
 
-  # default container images; override via env or CLI flags
   : "${WH_IMAGE:=ghcr.io/idoyo7/lxcfs-admission-webhook:latest}"
   : "${LXCFS_IMAGE:=ghcr.io/idoyo7/lxcfs:6.0.1-r1}"
 
-  if [[ $# -ge 1 ]]; then
+  while [[ $# -gt 0 ]]; do
     case $1 in
-    --namespace)
-      NAMESPACE=${2:-NAMESPACE}
-      shift 2
-      ;;
-    --deployment)
-      WH_DEP=${2:-WH_DEP}
-      shift 2
-      ;;
-    --service)
-      WH_SVC=${2:-WH_SVC}
-      shift 2
-      ;;
-    --secret)
-      WH_SECRET=${2:-WH_SECRET}
-      shift 2
-      ;;
-    --mutating)
-      MUTATING_WH_CONFIG=${2:-MUTATING_WH_CONFIG}
-      shift 2
-      ;;
-    --daemonset)
-      LXCFS_DS=${2:-LXCFS_DS}
-      shift 2
-      ;;
-    --create-cert-only)
-      CREATE_CERT_ONLY=true
-      shift
-      ;;
-    --help | -h)
-      help
-      exit 0
-      ;;
-    *)
-      echo -e "unknown parameter：$1\n"
-      usage
-      exit 22
-      ;;
+      --namespace)        NAMESPACE=$2; shift 2 ;;
+      --deployment)       WH_DEP=$2; shift 2 ;;
+      --service)          WH_SVC=$2; shift 2 ;;
+      --secret)           WH_SECRET=$2; shift 2 ;;
+      --mutating)         MUTATING_WH_CONFIG=$2; shift 2 ;;
+      --daemonset)        LXCFS_DS=$2; shift 2 ;;
+      --wh-image)         WH_IMAGE=$2; shift 2 ;;
+      --lxcfs-image)      LXCFS_IMAGE=$2; shift 2 ;;
+      --create-cert-only) CREATE_CERT_ONLY=true; shift ;;
+      -h|--help)          usage; exit 0 ;;
+      *) echo "unknown parameter: $1" >&2; usage; exit 22 ;;
     esac
-  fi
+  done
 
-  # just create cert and exit if flag CREATE_CERT_ONLY set to true
-  if [[ ${CREATE_CERT_ONLY} == true ]]; then
+  if [[ "${CREATE_CERT_ONLY}" == true ]]; then
     CERT_DIR="${PWD}/certs"
     mkdir -p "${CERT_DIR}"
     create_self_signed_cert
@@ -203,12 +181,14 @@ main() {
   pre_check
 
   cat <<EOF
-Create following k8s resources in namespace: ${NAMESPACE}
-  webhook service: ${WH_SVC}
-  webhook secret: ${WH_SECRET}
-  webhook deployment: ${WH_DEP}
-  lxcfs daemonset: ${LXCFS_DS}
-  mutating webhook configuration: ${MUTATING_WH_CONFIG}
+Installing in namespace: ${NAMESPACE}
+  webhook deployment:    ${WH_DEP}
+  webhook service:       ${WH_SVC}
+  webhook secret:        ${WH_SECRET} (managed by cert-manager)
+  lxcfs daemonset:       ${LXCFS_DS}
+  mutating config:       ${MUTATING_WH_CONFIG}
+  webhook image:         ${WH_IMAGE}
+  lxcfs image:           ${LXCFS_IMAGE}
 EOF
 
   create_k8s_resources

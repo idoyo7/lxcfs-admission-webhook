@@ -1,0 +1,62 @@
+---
+# Self-signed Issuer that bootstraps the local CA.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ${WH_DEP}-selfsigned
+  namespace: ${NAMESPACE}
+spec:
+  selfSigned: {}
+---
+# Local CA certificate, signed by the self-signed issuer above.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${WH_DEP}-ca
+  namespace: ${NAMESPACE}
+spec:
+  isCA: true
+  commonName: ${WH_SVC}-ca
+  secretName: ${WH_DEP}-ca
+  duration: 87600h0m0s   # 10 years
+  privateKey:
+    algorithm: RSA
+    size: 4096
+    rotationPolicy: Always
+  issuerRef:
+    name: ${WH_DEP}-selfsigned
+    kind: Issuer
+---
+# CA Issuer that issues the webhook serving certificate.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ${WH_DEP}-ca-issuer
+  namespace: ${NAMESPACE}
+spec:
+  ca:
+    secretName: ${WH_DEP}-ca
+---
+# Webhook serving certificate. The Secret it produces is what the
+# admission webhook Deployment mounts at /etc/webhook/certs.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${WH_DEP}
+  namespace: ${NAMESPACE}
+spec:
+  secretName: ${WH_SECRET}
+  duration: 8760h0m0s    # 1 year
+  renewBefore: 720h0m0s  # 30 days
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
+  dnsNames:
+    - ${WH_SVC}
+    - ${WH_SVC}.${NAMESPACE}
+    - ${WH_SVC}.${NAMESPACE}.svc
+    - ${WH_SVC}.${NAMESPACE}.svc.cluster.local
+  issuerRef:
+    name: ${WH_DEP}-ca-issuer
+    kind: Issuer
