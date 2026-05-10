@@ -8,7 +8,8 @@ RUN apk add --no-cache make git && make build
 
 FROM alpine:3.21
 
-LABEL maintainer="ymping <ympiing@gmail.com>"
+LABEL maintainer="idoyo7 <idoyo7@gmail.com>"
+LABEL org.opencontainers.image.source="https://github.com/idoyo7/lxcfs-admission-webhook"
 
 WORKDIR /lxcfs
 
