@@ -1,10 +1,16 @@
-FROM golang:1.24-alpine3.21 AS build
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine3.21 AS build
+ARG TARGETOS TARGETARCH
 
 WORKDIR /src
 
 ADD . .
 
-RUN apk add --no-cache make git && make build
+# Build runs on the runner's native arch (BUILDPLATFORM) and Go
+# cross-compiles for TARGETOS/TARGETARCH, so multi-arch publishes
+# don't pay the QEMU emulation tax for compilation.
+# CGO_ENABLED=0 keeps the binary fully static and arch-portable.
+RUN apk add --no-cache make git && \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 make build
 
 FROM alpine:3.21
 
