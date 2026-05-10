@@ -69,7 +69,17 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Login to ${{ env.REGISTRY }}
+      # Both helm push and `cosign sign` need to authenticate to GHCR.
+      # docker/login-action writes the docker config that cosign reads;
+      # `helm registry login` writes Helm's separate registry config.
+      - name: Log in to ${{ env.REGISTRY }} (Docker config, used by cosign)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to ${{ env.REGISTRY }} (Helm registry config, used by helm push)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
