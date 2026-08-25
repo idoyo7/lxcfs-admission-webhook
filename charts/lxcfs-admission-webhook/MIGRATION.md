@@ -1,71 +1,87 @@
 # Migration guide
 
-## To LXCFS 7.x (when Alpine packages it)
+## 0.2.x -> 0.3.0 (LXCFS 7.0.0)
 
-LXCFS upstream released 7.0 LTS on 2024-04-30 with notable additions
-(PSI virtualization, zswap accounting, pidfd as default) and notable
-removals (cgroup v1 support, libfuse2 support, cgroupfs emulation).
-At the time of writing, Alpine community ships only 6.0.1-r1 — no
-3.21/3.22/3.23 branch yet carries 7.x. The chart and image are
-preconfigured so the eventual migration is a values-only flip.
+Chart `0.3.0` moves the LXCFS image from an Alpine-packaged binary
+(`6.0.1-r1`, the last version Alpine community shipped) to a source
+build of the upstream `v7.0.0` release tarball
+(https://github.com/lxc/lxcfs/releases). This decouples the image
+from Alpine's packaging cadence, and it is a breaking change: LXCFS
+7.0 drops legacy cgroup v1 support and libfuse2, and changes pidfd
+handling from opt-in to mandatory.
 
-### What's already prepared
+### What changed
 
-- `lxcfs-image/Dockerfile` — `ENTRYPOINT` is fixed at
-  `dumb-init -- /lxcfs/entrypoint.sh`; `CMD` is the lxcfs flag list
-  and is overridable via `container.args`.
-- `lxcfs-image/entrypoint.sh` — passes `"$@"` straight through to
-  `/usr/bin/lxcfs`, so any flag list the chart provides reaches the
-  binary unchanged.
-- `charts/lxcfs-admission-webhook/values.yaml` — exposes
-  `lxcfs.args` (default mirrors the historical 6.x flag set).
-- `renovate.json` — tracks `alpine_3_21/lxcfs` via the repology
-  datasource and opens a PR bumping `LXCFS_VERSION` and the chart's
-  `lxcfs.image.tag` together when Alpine community publishes a new
-  revision.
+- `lxcfs-image/Dockerfile` is now a multi-stage build: an
+  `alpine:3.22` build stage compiles LXCFS from source with meson/
+  ninja, and the runtime stage copies only the resulting `lxcfs`
+  binary and `liblxcfs.so`. The runtime stage no longer installs the
+  Alpine `lxcfs` apk package, so libfuse2 is not pulled in at all.
+- `lxcfs-image/entrypoint.sh` now calls `fusermount3` instead of
+  `fusermount` to clean up stale mounts, matching the binary Alpine's
+  `fuse3` package actually ships.
+- `charts/lxcfs-admission-webhook/values.yaml` — `lxcfs.image.tag`
+  defaults to `7.0.0`.
+- `renovate.json` now tracks the `lxc/lxcfs` GitHub release feed
+  instead of the Alpine `repology` package feed.
 
-### Migration steps when 7.x lands in Alpine
+### Before you upgrade
 
-1. Merge the Renovate PR (or manually bump `LXCFS_VERSION` in
-   `lxcfs-image/.env` and `lxcfs.image.tag` in `values.yaml`). The
-   image-publish workflow rebuilds and pushes a new lxcfs image with
-   that revision tag.
-2. Decide which 7.x flags to opt into. In a downstream values file
-   (or directly in the chart's `values.yaml`):
-   ```yaml
-   lxcfs:
-     args:
-       - --foreground
-       - --enable-loadavg
-       - --enable-cfs
-       - --enable-psi-poll       # optional, 7.x: Pressure Stall Info
-       - --enable-zswap          # optional, 7.x: zswap accounting
+1. **Confirm every node LXCFS runs on is cgroup v2.** LXCFS 7.0 only
+   initializes against the unified cgroup hierarchy; nodes still on
+   cgroup v1 (legacy) or hybrid mode will fail to expose
+   container-aware `/proc` and `/sys` files. Check with:
+   ```sh
+   stat -fc %T /sys/fs/cgroup
    ```
-3. Bump the chart `version` in `Chart.yaml` (patch when only the
-   image revision changes, minor when adding flags), commit, and let
-   the chart-publish workflow push the new OCI artifact.
-4. Update the consuming Argo CD `Application`'s `targetRevision` to
-   the new chart version. Argo CD will recreate the LXCFS DaemonSet
-   pods with the new image and flags.
+   Expect `cgroup2fs`. Kubernetes 1.25+ defaults to cgroup v2 on
+   kernels 5.15+; older clusters or nodes booted with
+   `systemd.unified_cgroup_hierarchy=0` are not compatible with this
+   release and should stay on the 6.x image (see Rollback below)
+   until they are migrated to cgroup v2.
+2. **Do not add `--enable-pidfd` to `lxcfs.args`.** pidfd-based
+   process tracking is mandatory and default-on in 7.0 — the flag is
+   deprecated and only emits a warning if passed. The chart's default
+   `lxcfs.args` (`--foreground --enable-loadavg --enable-cfs`) is
+   unaffected and needs no change.
+3. **libfuse2 is no longer required or used.** The 7.0.0 image only
+   links against `libfuse3`; if you built a custom node image or
+   security policy around the old dependency, it can be dropped.
 
-### Compatibility notes
+### Upgrade steps
 
-- 7.x removes cgroup v1 support. Hosts must be on cgroup v2 (default
-  on kernels 5.15+ / Kubernetes 1.25+). Verify with
-  `stat -fc %T /sys/fs/cgroup` returning `cgroup2fs` on each node.
-- 7.x removes libfuse2 support. The chart already pulls `lxcfs` from
-  Alpine community where the package depends on `fuse3`; no node
-  configuration change required.
-- `--enable-cfs` continues to be accepted on cgroup v2 hosts in 6.x
-  and 7.x; remove it from `lxcfs.args` only if upstream announces a
-  removal.
-- `--enable-pidfd` becomes default-on in 7.x; do not pass it
-  explicitly (it emits a deprecation warning).
+1. Bump the chart to `0.3.0` (`helm repo update` /
+   `targetRevision: 0.3.0` for Argo CD). The default
+   `lxcfs.image.tag` moves to `7.0.0` automatically.
+2. Roll out to a cgroup v2 node first and confirm the LXCFS DaemonSet
+   pod starts and `/var/lib/lxc` mounts appear on the host, then let
+   the rest of the DaemonSet roll.
+3. No `lxcfs.args` changes are required to keep the historical 6.x
+   behavior. Optionally opt into new 7.x flags (e.g.
+   `--enable-psi-poll`) in a downstream values
+   override once you've validated them.
+
+### Staying on 6.x (cgroup v1 nodes)
+
+If some nodes cannot move to cgroup v2 yet, keep those node pools on
+the previous image by pinning the tag back:
+
+```yaml
+lxcfs:
+  image:
+    tag: 6.0.1-r1
+```
+
+This only works with chart `<= 0.2.3`, since `0.3.0`'s Dockerfile no
+longer builds or publishes a libfuse2-based image — the
+`ghcr.io/idoyo7/lxcfs:6.0.1-r1` tag published by prior chart versions
+remains available, but is no longer rebuilt or updated.
 
 ### Rollback
 
 The chart's previous OCI versions remain available
-(`oci://ghcr.io/idoyo7/charts/lxcfs-admission-webhook:0.2.x`). Roll
-back by changing the consumer's `targetRevision` to the prior tag;
-no manual cleanup is required because all chart resources are
-release-named and managed by Argo CD's prune/sync.
+(`oci://ghcr.io/idoyo7/charts/lxcfs-admission-webhook:0.2.3`). Roll
+back by changing the consumer's `targetRevision` to `0.2.3` (or
+earlier), which restores the `6.0.1-r1` image default; no manual
+cleanup is required because all chart resources are release-named and
+managed by Argo CD's prune/sync.

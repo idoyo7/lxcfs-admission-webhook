@@ -16,21 +16,22 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Track the lxcfs apk version pinned in lxcfs-image/.env against Alpine edge community.",
+      "description": "Track the lxcfs upstream release tarball version pinned in lxcfs-image/.env.",
       "fileMatch": ["^lxcfs-image/\\.env$"],
       "matchStrings": [
         "LXCFS_VERSION=(?<currentValue>[^\\s]+)"
       ],
-      "datasourceTemplate": "repology",
-      "depNameTemplate": "alpine_edge/lxcfs",
-      "versioningTemplate": "loose"
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "lxc/lxcfs",
+      "extractVersionTemplate": "^v(?<version>.*)$",
+      "versioningTemplate": "semver"
     },
     {
       "customType": "regex",
       "description": "Track values.yaml tags that carry an inline `# renovate: ...` marker.",
       "fileMatch": ["^charts/lxcfs-admission-webhook/values\\.yaml$"],
       "matchStrings": [
-        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)\\s*\\n\\s+tag:\\s+(?<currentValue>[^\\s#]+)"
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(?:\\s+extractVersion=(?<extractVersion>\\S+))?\\s*\\n\\s+tag:\\s+(?<currentValue>[^\\s#]+)"
       ],
       "versioningTemplate": "loose"
     }
@@ -38,11 +39,11 @@
 
   "packageRules": [
     {
-      "description": "Group every Alpine lxcfs bump (env + chart values) into one PR.",
-      "matchDatasources": ["repology"],
-      "matchPackageNames": ["alpine_edge/lxcfs"],
-      "groupName": "alpine lxcfs package",
-      "commitMessageTopic": "lxcfs (alpine edge community)",
+      "description": "Group every lxcfs upstream release bump (env + chart values) into one PR.",
+      "matchDatasources": ["github-releases"],
+      "matchPackageNames": ["lxc/lxcfs"],
+      "groupName": "lxcfs upstream release",
+      "commitMessageTopic": "lxcfs (upstream)",
       "addLabels": ["lxcfs-version"]
     },
     {

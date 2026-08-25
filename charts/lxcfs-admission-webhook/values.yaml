@@ -39,16 +39,16 @@ lxcfs:
   # `{releaseName}-{componentName}` (e.g. release `lxcfs` => `lxcfs-daemonset`).
   componentName: daemonset
   # -- Args passed to the lxcfs binary inside the container. Override
-  # this list to enable new flags (e.g. --enable-psi-poll, --enable-zswap)
-  # once Alpine packages LXCFS 7.x and you bump `lxcfs.image.tag`.
+  # this list to enable new flags (e.g. --enable-psi-poll)
+  # that ship in a newer LXCFS release when you bump `lxcfs.image.tag`.
   args:
     - --foreground
     - --enable-loadavg
     - --enable-cfs
   image:
     repository: ghcr.io/idoyo7/lxcfs
-    # renovate: datasource=repology depName=alpine_edge/lxcfs
-    tag: 6.0.1-r1
+    # renovate: datasource=github-releases depName=lxc/lxcfs extractVersion=^v(?<version>.*)$
+    tag: 7.0.0
     pullPolicy: Always
   resources:
     limits:

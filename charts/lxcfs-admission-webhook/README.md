@@ -87,7 +87,7 @@ documentation comments. Key parameters are summarised below.
 | `webhook.port` | `8443` | HTTPS port the webhook listens on |
 | `webhook.resources` | see values.yaml | CPU/memory limits for the webhook |
 | `lxcfs.image.repository` | `ghcr.io/idoyo7/lxcfs` | LXCFS image repository |
-| `lxcfs.image.tag` | `6.0.1-r1` | LXCFS image tag |
+| `lxcfs.image.tag` | `7.0.0` | LXCFS image tag |
 | `lxcfs.hostPath` | `/var/lib/lxc` | Node path where LXCFS state is exposed |
 | `lxcfs.tolerations` | tolerates master/control-plane | DaemonSet tolerations |
 | `certificate.ca.duration` | `87600h` (10 years) | Local CA certificate lifetime |
@@ -112,8 +112,9 @@ LXCFS DaemonSet (every linux node)
 
 ## Upgrades
 
-- See [MIGRATION.md](MIGRATION.md) for the LXCFS 7.x readiness path
-  and the values-only flip that lands the new release.
+- See [MIGRATION.md](MIGRATION.md) for the 0.2.x -> 0.3.0 (LXCFS
+  7.0.0) migration guide, including the cgroup v2 requirement and the
+  rollback path.
 - All chart resources are release-named, so rollbacks are
   `helm rollback` or an Argo CD `targetRevision` change away.
 
