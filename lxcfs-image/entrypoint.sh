@@ -6,7 +6,10 @@ LXCFS_PATH="${LXC_PATH}/lxcfs"
 LXCFS_SCRIPT_PATH="${LXC_PATH}/script"
 
 # Cleanup any stale mount left by a previous Pod on this node.
-nsenter --target 1 --mount -- fusermount -u "$LXCFS_PATH" 2>/dev/null || true
+# nsenter resolves the binary in the host mount namespace, so try both
+# the fuse3 and legacy fuse2 names depending on what the node ships.
+nsenter --target 1 --mount -- fusermount3 -u "$LXCFS_PATH" 2>/dev/null || \
+  nsenter --target 1 --mount -- fusermount -u "$LXCFS_PATH" 2>/dev/null || true
 [[ -d "$LXCFS_PATH" ]] && rm -rf "${LXCFS_PATH:?}"/*
 
 # Prepare directories.
