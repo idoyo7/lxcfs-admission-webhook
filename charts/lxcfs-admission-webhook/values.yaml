@@ -57,6 +57,15 @@ lxcfs:
     requests: {}
   # -- Host path used to expose LXCFS state to other Pods on the node
   hostPath: /var/lib/lxc
+  # -- Termination grace period for the DaemonSet Pod. The preStop hook
+  # unmounts the in-container bind mounts and then tears down the
+  # canonical FUSE mount at `{hostPath}/lxcfs`, and kubelet SIGKILLs
+  # whatever is still running when this window closes. The script's total
+  # budget is derived from this value as `max(5, this - 15)` seconds and
+  # passed in as `LXCFS_UMOUNT_BUDGET`, so the two cannot drift. 30 (the
+  # Kubernetes default, and what this chart used before 0.4.0) is not
+  # enough on a node with many mutated Pods -- see MIGRATION.md.
+  terminationGracePeriodSeconds: 60
   podAnnotations:
     mutating.lxcfs-admission-webhook.io/enable: "false"
   # -- Tolerations applied to the LXCFS DaemonSet (default tolerates control-plane)

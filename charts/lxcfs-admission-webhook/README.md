@@ -89,6 +89,7 @@ documentation comments. Key parameters are summarised below.
 | `lxcfs.image.repository` | `ghcr.io/idoyo7/lxcfs` | LXCFS image repository |
 | `lxcfs.image.tag` | `7.0.0-1` | LXCFS image tag |
 | `lxcfs.hostPath` | `/var/lib/lxc` | Node path where LXCFS state is exposed |
+| `lxcfs.terminationGracePeriodSeconds` | `60` | Window the preStop FUSE teardown must fit inside; the script's budget is derived from it as `max(5, value - 15)`s |
 | `lxcfs.tolerations` | tolerates master/control-plane | DaemonSet tolerations |
 | `certificate.ca.duration` | `87600h` (10 years) | Local CA certificate lifetime |
 | `certificate.serving.duration` | `8760h` (1 year) | Webhook serving cert lifetime |

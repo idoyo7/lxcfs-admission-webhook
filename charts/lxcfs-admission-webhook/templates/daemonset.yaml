@@ -18,6 +18,13 @@ spec:
         {{- toYaml .Values.lxcfs.podAnnotations | nindent 8 }}
     spec:
       hostPID: true
+      # preStop has no timeout of its own: it shares this window with
+      # SIGTERM and the container's exit, and kubelet SIGKILLs whatever is
+      # left. The teardown must therefore provably fit, because being
+      # killed halfway leaves the canonical FUSE mount behind -- possibly
+      # wedged -- for the next Pod to inherit. See MIGRATION.md for the
+      # arithmetic.
+      terminationGracePeriodSeconds: {{ .Values.lxcfs.terminationGracePeriodSeconds }}
       {{- with .Values.lxcfs.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
@@ -40,6 +47,18 @@ spec:
           {{- end }}
           securityContext:
             privileged: true
+          env:
+            # Derived from terminationGracePeriodSeconds rather than
+            # hardcoded, so raising or lowering the grace period cannot
+            # silently leave the script with a budget that does not fit
+            # inside it. The 15s held back covers the hook's own start-up,
+            # SIGTERM delivery, and the daemon's exit; kubelet also
+            # insists on at least 2s for the SIGTERM phase.
+            #
+            # nsenter passes its environment through, so this reaches the
+            # script even though the hook re-executes it on the host.
+            - name: LXCFS_UMOUNT_BUDGET
+              value: {{ max 5 (sub (int .Values.lxcfs.terminationGracePeriodSeconds) 15) | quote }}
           lifecycle:
             postStart:
               exec:
