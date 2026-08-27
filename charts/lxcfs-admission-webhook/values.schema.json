@@ -88,6 +88,11 @@
         },
         "resources": { "type": "object" },
         "hostPath": { "type": "string" },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 20,
+          "description": "Grace period for the LXCFS DaemonSet Pod. The preStop teardown budget is derived from it as max(5, value - 15)s; below 20 the FUSE teardown cannot fit its mandatory probe/abort/lazy-detach rungs"
+        },
         "podAnnotations": { "type": "object" },
         "tolerations": {
           "type": "array",

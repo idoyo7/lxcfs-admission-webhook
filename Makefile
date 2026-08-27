@@ -26,9 +26,12 @@ LDFLAGS := "-X 'main.Version=$(VERSION)' -X 'main.GoVersion=$(GO_VERSION)' -X 'm
 DOCKER_REGISTRY ?= ghcr.io/idoyo7
 DOCKER_IMAGE_WH := $(DOCKER_REGISTRY)/$(PROJECT_NAME)
 DOCKER_IMAGE_LXCFS := $(DOCKER_REGISTRY)/lxcfs
-DOCKER_TAG_LXCFS := 7.0.0
+# Single source of truth is lxcfs-image/.env, which CI also reads.
+LXCFS_VERSION := $(shell sed -n 's/^LXCFS_VERSION=//p' lxcfs-image/.env)
+LXCFS_IMAGE_REVISION := $(shell sed -n 's/^LXCFS_IMAGE_REVISION=//p' lxcfs-image/.env)
+DOCKER_TAG_LXCFS := $(LXCFS_VERSION)-$(LXCFS_IMAGE_REVISION)
 
-.PHONY: all dep lint vet test test-coverage build clean start-wh build-image-wh push-image-wh build-image-lxcfs push-image-lxcfs
+.PHONY: all dep lint vet test test-coverage build clean start-wh build-image-wh push-image-wh build-image-lxcfs push-image-lxcfs verify-image-lxcfs
 
 all: help
 
@@ -71,9 +74,12 @@ push-image-wh: build-image-wh ## Push lxcfs admission webhook docker images
 	@docker push $(DOCKER_IMAGE_WH):$(COMMIT_ID)
 
 build-image-lxcfs: ## Build lxcfs docker images
-	@cd lxcfs-image; docker build -t $(DOCKER_IMAGE_LXCFS):$(DOCKER_TAG_LXCFS) --build-arg LXCFS_VERSION=$(DOCKER_TAG_LXCFS) .
+	@cd lxcfs-image; docker build -t $(DOCKER_IMAGE_LXCFS):$(DOCKER_TAG_LXCFS) --build-arg LXCFS_VERSION=$(LXCFS_VERSION) .
 
-push-image-lxcfs: build-image-lxcfs ## Push lxcfs docker images
+verify-image-lxcfs: build-image-lxcfs ## Verify the lxcfs image answers cpuview-backed reads
+	@bash lxcfs-image/verify-lxcfs.sh image $(DOCKER_IMAGE_LXCFS):$(DOCKER_TAG_LXCFS)
+
+push-image-lxcfs: verify-image-lxcfs ## Push lxcfs docker images
 	@docker push $(DOCKER_IMAGE_LXCFS):$(DOCKER_TAG_LXCFS)
 
 help: ## Display this help screen
