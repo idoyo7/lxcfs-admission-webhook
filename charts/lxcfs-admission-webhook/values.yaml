@@ -48,7 +48,7 @@ lxcfs:
   image:
     repository: ghcr.io/idoyo7/lxcfs
     # renovate: datasource=github-releases depName=lxc/lxcfs extractVersion=^v(?<version>.*)$
-    tag: 7.0.0
+    tag: 7.0.0-1
     pullPolicy: Always
   resources:
     limits:

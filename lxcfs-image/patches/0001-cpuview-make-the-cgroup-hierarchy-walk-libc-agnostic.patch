@@ -1,0 +1,48 @@
+From: lxcfs-admission-webhook maintainers
+Subject: [PATCH] cpuview: make the cgroup hierarchy walk libc-agnostic
+
+get_min_cpu_count_cfs() walks a cgroup path towards the root by calling
+dirname() and then re-testing the *input* buffer, assuming dirname()
+truncated it in place. POSIX does not require that: dirname() may return
+a pointer to internal storage and leave its argument untouched.
+
+musl does exactly that for single-component absolute paths --
+dirname("/kubepods.slice") returns a static "/" and leaves
+"/kubepods.slice" in the buffer -- so `while (strcmp(cur_sg, "/") != 0)`
+never turns false. The FUSE worker thread servicing the read spins at
+100% CPU inside the read callback and never answers the request, so
+every reader of /proc/cpuinfo, /proc/stat and (with --enable-cfs)
+/sys/devices/system/cpu/online wedges in uninterruptible sleep.
+
+Copy dirname()'s result back into the buffer whenever it returned
+separate storage, so the walk terminates on every libc.
+
+Upstream report: https://github.com/lxc/lxcfs/issues/730
+Introduced by:   https://github.com/lxc/lxcfs/pull/690 (first shipped in v7.0.0)
+
+NOTE FOR MAINTAINERS: delete this patch (and the `patch` invocation in
+lxcfs-image/Dockerfile) once upstream ships a release containing the
+real fix. The build intentionally fails loudly if the patch no longer
+applies, rather than silently publishing an image that can hang a node.
+---
+--- a/src/proc_cpuview.c
++++ b/src/proc_cpuview.c
+@@ -495,6 +495,18 @@
+ 
+ 		char *parent = dirname(cur_sg); // walk up
+ 		if (strcmp(parent, ".") == 0) break; // in this case parent != cur_sg
++		/*
++		 * POSIX allows dirname() to return a pointer to internal
++		 * storage rather than truncating its argument in place.
++		 * musl does exactly that for a single-component absolute
++		 * path: dirname("/foo") hands back a static "/" and leaves
++		 * "/foo" untouched, so the loop condition below never turns
++		 * false and the FUSE worker thread spins forever at 100%
++		 * CPU. Copy the result back so the walk makes progress on
++		 * every libc. See https://github.com/lxc/lxcfs/issues/730
++		 */
++		if (parent != cur_sg)
++			memmove(cur_sg, parent, strlen(parent) + 1);
+ 	} while (strcmp(cur_sg, "/") != 0);
+ 	return got;
+ }

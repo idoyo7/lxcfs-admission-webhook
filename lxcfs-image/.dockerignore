@@ -1,0 +1,5 @@
+# The runtime stage does `ADD . /lxcfs`, so anything left in this
+# directory ends up in the published image. Keep it to the files the
+# container actually needs (entrypoint.sh, lxcfs-mount.sh, test scripts).
+.omc/
+.DS_Store

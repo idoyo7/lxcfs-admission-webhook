@@ -2,7 +2,7 @@ apiVersion: v2
 name: lxcfs-admission-webhook
 description: A Kubernetes admission webhook that auto-mounts LXCFS-virtualized /proc and /sys files into Pods so containers see cgroup-aware CPU/memory values.
 type: application
-version: 0.3.0
+version: 0.4.0
 appVersion: "0.1.0"
 home: https://github.com/idoyo7/lxcfs-admission-webhook
 sources:

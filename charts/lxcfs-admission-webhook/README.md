@@ -87,7 +87,7 @@ documentation comments. Key parameters are summarised below.
 | `webhook.port` | `8443` | HTTPS port the webhook listens on |
 | `webhook.resources` | see values.yaml | CPU/memory limits for the webhook |
 | `lxcfs.image.repository` | `ghcr.io/idoyo7/lxcfs` | LXCFS image repository |
-| `lxcfs.image.tag` | `7.0.0` | LXCFS image tag |
+| `lxcfs.image.tag` | `7.0.0-1` | LXCFS image tag |
 | `lxcfs.hostPath` | `/var/lib/lxc` | Node path where LXCFS state is exposed |
 | `lxcfs.tolerations` | tolerates master/control-plane | DaemonSet tolerations |
 | `certificate.ca.duration` | `87600h` (10 years) | Local CA certificate lifetime |
@@ -112,11 +112,19 @@ LXCFS DaemonSet (every linux node)
 
 ## Upgrades
 
-- See [MIGRATION.md](MIGRATION.md) for the 0.2.x -> 0.3.0 (LXCFS
-  7.0.0) migration guide, including the cgroup v2 requirement and the
-  rollback path.
-- All chart resources are release-named, so rollbacks are
-  `helm rollback` or an Argo CD `targetRevision` change away.
+- See [MIGRATION.md](MIGRATION.md) before upgrading. Chart `0.3.0` is
+  **not safe to deploy** — its LXCFS image hangs every reader of
+  `/proc/cpuinfo`, `/proc/stat` and `/sys/devices/system/cpu/online`
+  ([lxc/lxcfs#730](https://github.com/lxc/lxcfs/issues/730)). Go from
+  `0.2.x` straight to `0.4.0`.
+- MIGRATION.md also covers the cgroup v2 requirement, a pre-flight check
+  that actually exercises the affected files, and the recovery procedure
+  for a node with a wedged or leaked LXCFS mount.
+- Chart resources are all release-named and pruned by `helm rollback` or an
+  Argo CD `targetRevision` change — but the LXCFS FUSE mount is not a
+  Kubernetes resource and leaks into the host mount namespace, so a
+  rollback away from a wedged daemon needs manual node cleanup. See
+  MIGRATION.md (Recovery).
 
 ## Source
 

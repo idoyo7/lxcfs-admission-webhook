@@ -60,11 +60,12 @@ jobs:
       - name: Read LXCFS upstream version
         id: lxcfsenv
         run: |
-          # Sourced regardless of matrix entry so the step output is
-          # always defined; the corresponding tag rule is gated below.
+          # Sourced regardless of matrix entry so the step outputs are
+          # always defined; the corresponding tag rules are gated below.
           # shellcheck disable=SC1091
           . lxcfs-image/.env
           echo "version=${LXCFS_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "revision=${LXCFS_IMAGE_REVISION}" >> "$GITHUB_OUTPUT"
 
       - name: Extract Docker metadata
         id: meta
@@ -78,7 +79,29 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
+            # Immutable handle: upstream version plus this repo's image
+            # build revision, so an image-only rebuild is distinguishable
+            # from the build that shipped with the same LXCFS release.
+            type=raw,value=${{ steps.lxcfsenv.outputs.version }}-${{ steps.lxcfsenv.outputs.revision }},enable=${{ matrix.image == 'lxcfs' }}
+            # Floating alias, always the newest revision of this version.
             type=raw,value=${{ steps.lxcfsenv.outputs.version }},enable=${{ matrix.image == 'lxcfs' }}
+
+      # A daemon that starts, prints its api_extensions and mounts
+      # successfully proves nothing: chart 0.3.0 shipped an image that did
+      # all three and then hung every reader of /proc/cpuinfo,
+      # /proc/stat and /sys/devices/system/cpu/online
+      # (https://github.com/lxc/lxcfs/issues/730). Read those files before
+      # publishing. Host arch only -- the arm64 leg is QEMU-emulated and
+      # cannot run a privileged FUSE mount.
+      - name: Smoke-test the LXCFS image
+        if: matrix.image == 'lxcfs'
+        run: |
+          docker buildx build --load \
+            --platform linux/amd64 \
+            --build-arg "LXCFS_VERSION=${{ steps.lxcfsenv.outputs.version }}" \
+            -t lxcfs-smoketest:local \
+            -f "${{ matrix.dockerfile }}" "${{ matrix.context }}"
+          bash lxcfs-image/verify-lxcfs.sh image lxcfs-smoketest:local
 
       - name: Build and push
         id: build-and-push
@@ -88,6 +111,12 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/amd64,linux/arm64
+          # Passed explicitly rather than relying on the Dockerfile's ARG
+          # default, so lxcfs-image/.env stays the single source of truth
+          # and the published tag can never disagree with the source
+          # tarball actually built.
+          build-args: |
+            LXCFS_VERSION=${{ steps.lxcfsenv.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
