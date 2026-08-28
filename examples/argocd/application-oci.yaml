@@ -25,7 +25,7 @@ spec:
     # OCI Helm chart published by the project's CI on every chart bump.
     repoURL: ghcr.io/idoyo7/charts
     chart: lxcfs-admission-webhook
-    targetRevision: 0.1.0   # bump in lockstep with chart releases
+    targetRevision: 0.4.1   # bump in lockstep with chart releases
     helm:
       releaseName: lxcfs-admission-webhook
       values: |
@@ -37,7 +37,7 @@ spec:
         lxcfs:
           image:
             repository: ghcr.io/idoyo7/lxcfs
-            tag: 7.0.0-1
+            tag: 7.0.0-2
         mutatingWebhook:
           failurePolicy: Ignore  # flip to Fail once you trust it
           namespaceSelector:

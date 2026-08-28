@@ -12,7 +12,7 @@
 # successfully therefore proves nothing -- only reading a cpuview-backed
 # file does.
 #
-#   ./verify-lxcfs.sh image ghcr.io/idoyo7/lxcfs:7.0.0-1
+#   ./verify-lxcfs.sh image ghcr.io/idoyo7/lxcfs:7.0.0-2
 #   ./verify-lxcfs.sh cluster -n lxcfs
 #
 # See charts/lxcfs-admission-webhook/MIGRATION.md.
@@ -43,9 +43,11 @@ usage() {
 usage: ${0##*/} image <image-ref> [--runtime docker|podman|nerdctl]
        ${0##*/} cluster [-n NAMESPACE] [--label app.kubernetes.io/name=lxcfs-admission-webhook]
 
-  image    Run <image-ref> as a privileged container and read every
-           virtualized file through its own FUSE mount. Requires a
-           container runtime on this machine.
+  image    Run <image-ref> as a privileged container, read every
+           virtualized file through its own FUSE mount, and check that the
+           staged busybox can bind one of them into a root that contains
+           no other executable and no dynamic loader. Requires a container
+           runtime on this machine.
 
   cluster  Run a throwaway probe Pod in NAMESPACE and read the LXCFS
            files a mutated Pod would see. Requires kubectl and a
@@ -81,6 +83,108 @@ for f in ${CPUVIEW_FILES[*]}; do
   if [ \$rc -eq 0 ]; then echo "  ok      \$f  |\$out|"
   else echo "  FAIL    \$f  rc=\$rc  |\$out|  <-- cpuview-backed"; fail=1; fi
 done
+if [ \$fail -eq 0 ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
+EOF
+}
+
+# The distroless-bind check that runs inside the container. Emitted as a
+# here-doc for the same reason as read_probe_script.
+#
+# What this gates, and why it is shaped like this
+# -----------------------------------------------
+# Chart 0.4.0's postStart hook could not restore bind mounts in a
+# container whose image ships no mount/umount: `nsenter -t <pid> -m --
+# mount` resolves the binary inside the target, so it never ran, and the
+# resulting exit status was read as "nothing to do". 0.4.1 executes a
+# statically linked busybox staged at /var/lib/lxc/script/busybox instead.
+#
+# The full end-to-end proof needs two containers sharing the FUSE mount
+# through the node, which needs mount propagation set up on the host --
+# out of reach for a build-time gate that only has a container runtime.
+# What image mode *can* prove, without leaving the container, is every
+# property whose loss caused the bug:
+#
+#   - the staged busybox exists and is statically linked
+#   - it executes with no dynamic loader reachable (chroot into a root
+#     that has no /lib), which is exactly the distroless condition
+#   - it accepts the two invocations lxcfs-mount.sh uses. This is the
+#     check that would have caught 0.4.0's second failure: `mount -B` is
+#     util-linux-only, so it also broke every Alpine-based container,
+#     whose busybox mount rejects the flag.
+#   - the two-step bind yields a read-only fuse.lxcfs mount, and reading
+#     through it returns LXCFS data
+#
+# Cluster mode covers the rest: there, a real DaemonSet roll drives the
+# real hooks against real Pods.
+distroless_bind_script() {
+  local base=$1
+  cat <<EOF
+set -u
+bb=/var/lib/lxc/script/busybox
+root=/tmp/lxcfs-nolibc
+src=${base}/proc/meminfo
+fail=0
+
+step() { printf '  %-7s %s\n' "\$1" "\$2"; [ "\$1" = FAIL ] && fail=1; return 0; }
+
+if [ -x "\$bb" ]; then step ok "staged busybox present: \$bb (\$(wc -c <"\$bb") bytes)"
+else step FAIL "no staged busybox at \$bb"; echo "VERDICT: FAIL"; exit 0; fi
+
+if ldd "\$bb" 2>&1 | grep -Eq 'not a dynamic executable|statically linked'; then
+  step ok "statically linked"
+else
+  step FAIL "dynamically linked: \$(ldd "\$bb" 2>&1 | head -1)"
+fi
+
+# A root with nothing in it but the node's /var/lib/lxc. No /lib, so no
+# dynamic loader; no /bin, so no mount, umount, test or sh.
+rm -rf "\$root"
+mkdir -p "\$root/var/lib/lxc" "\$root/proc" || step FAIL "cannot build \$root"
+: > "\$root/proc/meminfo"
+mount -o rbind /var/lib/lxc "\$root/var/lib/lxc" || step FAIL "cannot rbind /var/lib/lxc into \$root"
+step ok "built an executable-free root at \$root (\$(ls -A "\$root" | tr '\n' ' '))"
+
+if chroot "\$root" "\$bb" mount -o bind "\$src" /proc/meminfo; then
+  step ok "chroot \$bb mount -o bind \$src /proc/meminfo"
+else
+  step FAIL "chroot \$bb mount -o bind failed (rc=\$?)"
+fi
+
+if chroot "\$root" "\$bb" mount -o remount,bind,ro,nosuid,nodev /proc/meminfo /proc/meminfo; then
+  step ok "chroot \$bb mount -o remount,bind,ro,nosuid,nodev"
+else
+  step FAIL "chroot \$bb read-only remount failed (rc=\$?)"
+fi
+
+opts=\$(awk -v p="\$root/proc/meminfo" '
+  { fstype = ""
+    for (i = 7; i <= NF; i++) if (\$i == "-") { fstype = \$(i + 1); break }
+    if (\$5 == p) print \$6 " " fstype }' /proc/self/mountinfo)
+case "\$opts" in
+  *fuse.lxcfs*) step ok "mount table says: \$opts" ;;
+  '')           step FAIL "\$root/proc/meminfo is not in the mount table at all" ;;
+  *)            step FAIL "not a fuse.lxcfs mount: \$opts" ;;
+esac
+case "\$opts" in
+  ro,*|*,ro,*|*,ro) : ;;
+  *) step FAIL "bind is not read-only: \$opts" ;;
+esac
+
+out=\$(timeout ${READ_TIMEOUT} head -1 "\$root/proc/meminfo" 2>&1)
+case "\$out" in
+  MemTotal:*) step ok "read through the bind: |\$out|" ;;
+  *)          step FAIL "read through the bind returned |\$out|" ;;
+esac
+
+if chroot "\$root" "\$bb" umount /proc/meminfo; then
+  step ok "chroot \$bb umount /proc/meminfo"
+else
+  step FAIL "chroot \$bb umount failed (rc=\$?)"
+fi
+
+umount -R "\$root/var/lib/lxc" 2>/dev/null
+rm -rf "\$root"
+
 if [ \$fail -eq 0 ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
 EOF
 }
@@ -143,7 +247,30 @@ verify_image() {
     echo "7.0.0 musl hang (https://github.com/lxc/lxcfs/issues/730)."
     return 1
   fi
-  [[ $out == *"VERDICT: PASS"* ]]
+  [[ $out == *"VERDICT: PASS"* ]] || return 1
+
+  echo
+  echo "binding a virtualized file into a root with no executables and no loader:"
+  local dl_out
+  dl_out=$(run_with_deadline $((READ_TIMEOUT * 4 + 20)) \
+           "$runtime" exec "$name" sh -c "$(distroless_bind_script "$MOUNT_PATH")")
+  local dl_rc=$?
+  echo "$dl_out"
+
+  if ((dl_rc == 124)); then
+    echo
+    echo "VERDICT: FAIL - the distroless bind check never returned."
+    return 1
+  fi
+  if [[ $dl_out != *"VERDICT: PASS"* ]]; then
+    echo
+    echo "VERDICT: FAIL - this image cannot restore bind mounts in a container"
+    echo "that ships no mount/umount of its own. Chart 0.4.0 shipped exactly"
+    echo "that defect and skipped such containers in silence; see"
+    echo "charts/lxcfs-admission-webhook/MIGRATION.md (0.4.0 -> 0.4.1)."
+    return 1
+  fi
+  return 0
 }
 
 cleanup_image() {

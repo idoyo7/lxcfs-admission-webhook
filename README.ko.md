@@ -134,7 +134,7 @@ cd lxcfs-admission-webhook/deploy
 | `--daemonset` | `lxcfs-ds` |
 | `--mutating` | `lxcfs-admission-webhook` |
 | `--wh-image` / `WH_IMAGE` | `ghcr.io/idoyo7/lxcfs-admission-webhook:latest` |
-| `--lxcfs-image` / `LXCFS_IMAGE` | `ghcr.io/idoyo7/lxcfs:7.0.0-1` |
+| `--lxcfs-image` / `LXCFS_IMAGE` | `ghcr.io/idoyo7/lxcfs:7.0.0-2` |
 
 ---
 
@@ -202,7 +202,7 @@ Helm chart의 주요 운영 설정은 [`values.yaml`](charts/lxcfs-admission-web
 | `webhook.replicas` | `2` |
 | `webhook.port` | `8443` |
 | `lxcfs.image.repository` | `ghcr.io/idoyo7/lxcfs` |
-| `lxcfs.image.tag` | `7.0.0-1` |
+| `lxcfs.image.tag` | `7.0.0-2` |
 | `lxcfs.hostPath` | `/var/lib/lxc` |
 | `mutatingWebhook.namespaceSelector.matchLabels.lxcfs-admission-webhook` | `enabled` |
 | `mutatingWebhook.timeoutSeconds` | `5` |

@@ -1,5 +1,191 @@
 # Migration guide
 
+## 0.4.0 -> 0.4.1 (restores LXCFS in containers that ship no `mount`)
+
+Image-and-scripts only. `values.yaml`, the templates and the webhook
+binary are untouched, so this is a patch bump: `lxcfs.image.tag` moves
+from `7.0.0-1` to `7.0.0-2` and nothing else in your values changes.
+
+### What broke
+
+`lxcfs-mount.sh` reached into each mutated container with
+
+```sh
+nsenter -t "$pid" -m    -- test -e "/proc/$file"
+nsenter -t "$pid" -m -p -- mount -t fuse.lxcfs | grep -qs "/proc/$file"
+nsenter -t "$pid" -m    -- mount -B -v -o ro "$src" "/proc/$file"
+nsenter -t "$pid" -m -p -- umount -v "/proc/$file"
+```
+
+`nsenter -m` enters the target's mount namespace and *then* resolves the
+program, so the binary has to exist inside the workload's image. Two
+different image families do not have one:
+
+| Image family | What happens | Symptom in the container |
+|---|---|---|
+| distroless (oauth2-proxy, istio-proxy, `gcr.io/distroless/*`, Chainguard) | no `test`, `mount`, `umount` or `sh` at all; `nsenter` exits 127 with `nsenter: failed to execute test: No such file or directory` | stale binds survive preStop and are never replaced, so every read of a virtualized file returns **`Transport endpoint is not connected`** |
+| Alpine / busybox-based | `test` and `umount` work, but busybox's `mount` rejects `-B`: `mount: invalid option -- 'B'` | preStop *does* remove the binds and postStart cannot recreate them, so the container silently falls back to **the node's `/proc`** |
+
+Either way the script read the failure as "the path is not mounted, so
+there is nothing to do", logged nothing, and exited 0. The binds were
+created correctly at Pod creation — kubelet makes those, not this script —
+so the damage only appeared at the first DaemonSet roll after the Pod
+started, and then persisted. On the cluster this was found on, three
+oauth2-proxy Pods had been in that state for 75 days.
+
+### The fix
+
+Two of the three in-container calls turned out not to need a process in
+the container at all, and are now done from the node through procfs:
+
+- **Mount-table lookup** reads `/proc/<pid>/mountinfo`. procfs renders the
+  mount table of whatever namespace the task is in, so `is_lxcfs_mounted`
+  is now an `awk` over a text file. Strictly better than the old
+  `mount -t fuse.lxcfs | grep`: no dependency, no fork of a `mount(8)` per
+  path, and it cannot block on a wedged server because it never stat()s a
+  mount point.
+- **Existence probe** reads `/proc/<pid>/root/<path>`. That magic symlink
+  is resolved by the kernel against the target's root *and* mount
+  namespace, so a stat there traverses the same FUSE mount `test -e`
+  traversed. Semantics are unchanged (existence, not readability). It can
+  still block, so it stays inside the same bounded-probe machinery
+  (`run_bounded`) as before — never `timeout(1)`, which would itself block
+  in `wait()` on a reader parked in uninterruptible sleep.
+
+`mount(2)` and `umount2(2)` act on the caller's mount namespace, so those
+two genuinely have to run inside the target. The image now ships
+`busybox-static` and `entrypoint.sh` stages it at
+**`/var/lib/lxc/script/busybox`**, next to `lxcfs-mount.sh`. The webhook
+already bind-mounts `/var/lib/lxc/` into every Pod it mutates
+(`cmd/volume.go`, ninth mount, `HostToContainer`), so that path is
+reachable inside every container this script touches — with no cooperation
+from the workload's image, and no dynamic loader needed, which those
+images also lack. Executing from a read-only mount is fine; only `noexec`
+would stop it, and a hostPath mount does not carry it.
+
+The invocation changed with it, because `-B` and `-v` are util-linux-only:
+
+```sh
+nsenter -t "$pid" -m -- /var/lib/lxc/script/busybox mount -o bind "$src" "$target"
+nsenter -t "$pid" -m -- /var/lib/lxc/script/busybox mount -o remount,bind,ro,nosuid,nodev "$target" "$target"
+```
+
+Two calls, because `mount(2)` ignores `MS_RDONLY` on a bind — the new
+mount inherits the source's flags — and only a second
+`MS_REMOUNT|MS_BIND|MS_RDONLY` call makes it read-only. util-linux issues
+that remount for you; busybox does not. `nosuid,nodev` are named because a
+remount replaces the flags with exactly what it is given; `0.4.0`'s
+`mount -B -o ro` dropped them, so a restored bind is now
+*indistinguishable* from the one kubelet makes at Pod creation.
+
+If the staged busybox is missing (a node still running an older image),
+the script falls back to the container's own `mount`/`umount`, located by
+stat()ing `/proc/<pid>/root/{usr/bin,bin,usr/sbin,sbin}` from the node so
+an absent tool is discovered *before* anything is exec'd.
+
+### It no longer fails silently
+
+This was the actual defect: an exec failure was indistinguishable from
+"nothing to do".
+
+- `is_lxcfs_mounted` has three outcomes, not two: mounted, not mounted,
+  and **could not find out**.
+- Every bind is verified against the container's mount table afterwards,
+  rather than trusted because the command exited 0.
+- `nsenter`'s 126/127 exit statuses are reported as "could not execute
+  anything inside that container", with the paths it looked in.
+- `--remount` always prints a tally, including on a healthy run:
+  `remount finished in 8s: 24 bound, 0 already mounted, 0 source(s)
+  absent, 0 failed`. "Did no work" is now visibly different from "had no
+  work to do".
+- `--remount` exits **non-zero** when it could not complete work it was
+  supposed to do, which surfaces as `FailedPostStartHook`. A container
+  that merely exited mid-scan is reported but does not fail the hook —
+  normal Pod churn must not take a node's hook down.
+
+`--umount` keeps its exit semantics (it fails only when the canonical host
+mount could not be cleared) but now reports containers it had to leave
+alone.
+
+Everything from `0.4.0` is unchanged: the bounded probes, the global
+`--umount` deadline and its derivation from
+`terminationGracePeriodSeconds`, the FUSE-connection abort ladder, and the
+healthy-path timings.
+
+### Before you upgrade
+
+**Pods created before this fix keep working until the next DaemonSet
+roll.** Their binds were made by kubelet at Pod creation and are still
+intact; nothing in `0.4.0` removes them while the DaemonSet stays up. The
+loss happens at the first roll after the Pod started — preStop tears the
+canonical mount down and postStart cannot restore the binds — so *this
+upgrade is itself such a roll*. Expect the following on nodes running
+distroless or Alpine-based mutated Pods:
+
+1. `0.4.0`'s preStop runs (it is the version being replaced), so those
+   containers end the roll with either stale ENOTCONN binds (distroless)
+   or no binds (Alpine).
+2. `0.4.1`'s postStart then repairs both cases: it detaches a stale bind
+   and re-binds it, and it creates a missing one.
+
+So the repair is automatic, but there is a window — a few seconds on a
+small node — during which a mutated container reads either ENOTCONN or the
+node's `/proc`. Workloads that read these files once at startup (JVMs
+sizing their heap, `GOMAXPROCS`, thread pools) do not notice; workloads
+that read them continuously see one bad interval.
+
+**Find the Pods that were already broken before this upgrade.** They will
+not fix themselves until the roll reaches their node:
+
+```sh
+# distroless case: reads fail outright
+kubectl get pods -A -o json |
+  jq -r '.items[] | select(.metadata.annotations["mutating.lxcfs-admission-webhook.io/status"] == "mutated") |
+         "\(.metadata.namespace)/\(.metadata.name) \(.spec.nodeName)"'
+```
+
+For each one, the honest check is the DaemonSet's own report on that node
+after upgrading — `kubectl logs` the DaemonSet Pod and look for the
+`remount finished` line and any `LXCFS bind mounts could not be restored`
+block.
+
+### Upgrade steps
+
+1. Bump the chart to `0.4.1` (`helm repo update`, or
+   `targetRevision: 0.4.1` for Argo CD). `lxcfs.image.tag` moves to
+   `7.0.0-2` automatically.
+2. Verify the image before it reaches a node. The checker now also asserts
+   that the staged busybox can bind a virtualized file into a root with no
+   other executable and no dynamic loader — the exact condition that broke:
+   ```sh
+   ./lxcfs-image/verify-lxcfs.sh image ghcr.io/idoyo7/lxcfs:7.0.0-2
+   ```
+   It fails against `7.0.0-1`, which is the point.
+3. Roll one node first and read the DaemonSet Pod's log. A healthy node
+   prints one `in-container mount tool = busybox (...)` line per mutated
+   container and a `remount finished ... 0 failed` tally.
+4. Confirm from inside a distroless Pod that values are cgroup-limited
+   again. If it has no shell, the staged busybox is reachable inside it:
+   ```sh
+   kubectl exec <pod> -- /var/lib/lxc/script/busybox head -1 /proc/meminfo
+   ```
+   Compare against the node's own `MemTotal`; they must differ.
+
+### If a container still cannot be served
+
+`--remount` names it and exits non-zero. The two causes:
+
+- **The node has no staged busybox.** The DaemonSet Pod is running an
+  image older than `7.0.0-2`, or its entrypoint could not write to
+  `{hostPath}/script`. `entrypoint.sh` refuses to start the daemon in that
+  case, so a CrashLoopBackOff on the DaemonSet is the expected signal.
+- **The Pod does not carry the `/var/lib/lxc/` mount.** It was mutated by
+  a webhook version older than the ninth mount in `cmd/volume.go`.
+  Recreate the Pod.
+
+Both leave the container reading the node's `/proc`, which is wrong but
+not dangerous; nothing hangs.
+
 ## 0.3.0 -> 0.4.0 (fixes a node-hanging regression in 0.3.0)
 
 > **Do not run chart `0.3.0`, and do not roll back to it.** Its LXCFS

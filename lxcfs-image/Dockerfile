@@ -136,8 +136,21 @@ ENV LXCFS_VERSION=${LXCFS_VERSION}
 # fuse3 provides both fusermount3 and fusermount (Alpine ships only the
 # former, which is why entrypoint.sh tries both names); libfuse3-3 is the
 # runtime library lxcfs links against; dumb-init reaps zombies. bash,
-# nsenter/umount (util-linux), awk and coreutils' timeout already ship in
-# debian:bookworm-slim.
+# nsenter/umount (util-linux), awk, cmp, stat and coreutils' timeout
+# already ship in debian:bookworm-slim.
+#
+# busybox-static is not for this container's own use. entrypoint.sh stages
+# it onto the node at /var/lib/lxc/script/busybox, from where
+# lxcfs-mount.sh exec's it inside each mutated container to run the one
+# thing that cannot be done from the host: mount(2) and umount2(2) act on
+# the caller's mount namespace. `nsenter -t <pid> -m -- mount` resolves the
+# binary in the *target's* filesystem, so it fails outright in a distroless
+# image -- oauth2-proxy, istio-proxy, anything on gcr.io/distroless or a
+# Chainguard base -- which ships no mount, no umount, no test and no shell.
+# The webhook already bind-mounts /var/lib/lxc/ into every Pod it mutates
+# (cmd/volume.go), so a binary dropped there is reachable inside all of
+# them with no cooperation from the workload's image. Static because those
+# images have no dynamic loader either.
 #
 # The loop is a build-time contract, not decoration: entrypoint.sh,
 # lxcfs-mount.sh and verify-lxcfs.sh shell out to every one of these, and
@@ -148,10 +161,23 @@ RUN chmod +x /lxcfs/entrypoint.sh /lxcfs/verify-lxcfs.sh && \
     apt-get install -y --no-install-recommends \
         dumb-init \
         fuse3 \
-        libfuse3-3 && \
+        libfuse3-3 \
+        busybox-static && \
     rm -rf /var/lib/apt/lists/* && \
-    for b in bash nsenter umount awk timeout fusermount3 fusermount dumb-init; do \
+    for b in bash nsenter mount umount chroot awk cmp stat timeout fusermount3 fusermount dumb-init busybox; do \
         command -v "$b" >/dev/null || { echo "missing required binary: $b" >&2; exit 1; }; \
+    done && \
+    # Prove the staged busybox is what the distroless path needs. A
+    # dynamically linked one would fail to exec in exactly the containers
+    # this exists for, and an applet compiled out would fail at the mount.
+    if ! ldd /bin/busybox 2>&1 | grep -Eq 'not a dynamic executable|statically linked'; then \
+        echo "ERROR: /bin/busybox is not statically linked" >&2; \
+        ldd /bin/busybox >&2 || true; \
+        exit 1; \
+    fi && \
+    for a in mount umount; do \
+        busybox --list | grep -qx "$a" || \
+            { echo "ERROR: busybox has no '$a' applet" >&2; exit 1; }; \
     done
 
 COPY --from=build /out/usr/bin/lxcfs /usr/bin/lxcfs

@@ -5,9 +5,49 @@
 PATH=$PATH:/bin
 LXC_PATH="/var/lib/lxc"
 LXCFS_PATH="${LXC_PATH}/lxcfs"
+LXCFS_SCRIPT_PATH="${LXC_PATH}/script"
 
 UMOUNT=false
 REMOUNT=false
+
+# --------------------------------------------------------------------------
+# Running mount/umount inside a container that ships neither
+# --------------------------------------------------------------------------
+# `nsenter -t <pid> -m -- <cmd>` enters the target's mount namespace and
+# only *then* resolves <cmd>, so the binary has to exist in the target's
+# filesystem. A distroless image (oauth2-proxy, istio-proxy, anything on
+# gcr.io/distroless or a Chainguard base) has no test, mount, umount or
+# even sh, so every one of those calls failed to exec -- and this script
+# used to read the resulting non-zero status as "the path is not there"
+# and skip the container without a word. See MIGRATION.md (0.4.0 ->
+# 0.4.1).
+#
+# Two of the three in-container calls turned out not to need a container
+# process at all and are now done from the host through procfs; see
+# is_lxcfs_mounted() and probe_path(). mount(2) and umount2(2) act on the
+# caller's mount namespace, so those two genuinely have to run inside the
+# target, which means something executable must be reachable there.
+#
+# That something is a statically linked busybox. entrypoint.sh stages it
+# into $LXCFS_SCRIPT_PATH, i.e. under $LXC_PATH, which the webhook
+# bind-mounts into every Pod it mutates (cmd/volume.go, the ninth mount:
+# MountPath /var/lib/lxc/, HostToContainer). It is therefore reachable at
+# this exact absolute path inside every container this script ever touches,
+# with no cooperation from the image, and being static it needs no dynamic
+# loader either -- which a distroless image also lacks.
+CONTAINER_BUSYBOX="${LXCFS_SCRIPT_PATH}/busybox"
+
+# Where to look for the container's own mount/umount when the staged
+# busybox is missing (an image built before 0.4.1, or a node whose
+# /var/lib/lxc was not injected). Absolute paths, checked from the host
+# via /proc/<pid>/root, so an image that ships them is still served and
+# one that does not is *reported* rather than silently skipped.
+CONTAINER_TOOL_DIRS=(/usr/bin /bin /usr/sbin /sbin)
+
+# Set by resolve_container_tools() for the container being processed.
+CT_MOUNT=()
+CT_UMOUNT=()
+CT_KIND="none"
 
 # Every probe and mount operation below touches the LXCFS FUSE mount, and
 # a FUSE mount whose daemon has stopped answering blocks its readers in
@@ -24,6 +64,25 @@ ACTION_TIMEOUT="${LXCFS_ACTION_TIMEOUT:-15}"
 
 # Paths whose probe timed out, i.e. paths served by a wedged FUSE mount.
 WEDGED_PATHS=()
+
+# --------------------------------------------------------------------------
+# --remount accounting
+# --------------------------------------------------------------------------
+# Telling these apart is the whole point of the 0.4.1 pass. 0.4.0 had one
+# bucket -- "non-zero, so presumably nothing to do" -- which collapsed
+# "the path is not mounted" together with "I could not find out", and the
+# second case then produced no log line at all. Three oauth2-proxy Pods
+# sat unvirtualized for 75 days behind that silence.
+#
+# REMOUNT_FAILED is work this run was supposed to do and did not; it makes
+# --remount exit non-zero. The other two are informational.
+REMOUNT_BOUND=0            # binds this run created
+REMOUNT_ALREADY=0          # already bound, nothing to do
+REMOUNT_ABSENT=0           # source genuinely not present
+REMOUNT_FAILED=()          # hard failures -> non-zero exit
+REMOUNT_DEGRADED=()        # done, but not exactly as intended
+UNREACHABLE_CONTAINERS=()  # container exited mid-scan; normal churn
+UNTOOLED_CONTAINERS=()     # nothing executable reachable inside
 
 # --------------------------------------------------------------------------
 # Global deadline for --umount
@@ -167,12 +226,37 @@ mountinfo_file() {
   fi
 }
 
-# Is <path> a mount point in that namespace?
+# Is <path> a mount point according to the mount table <file>?
 #
 # Parses the mount table only -- it never stat()s the path, so unlike
-# mountpoint(1) it cannot block on a wedged FUSE server.
+# mountpoint(1) it cannot block on a wedged FUSE server. Field 5 is the
+# mount point, expressed relative to the root of the process whose table
+# this is, which for both /proc/1 and a container's PID 1 is "/".
+is_mounted_in() {
+  awk -v p="$2" '$5 == p { found = 1 } END { exit !found }' "$1"
+}
+
+# Is <path> a mount point in the namespace the canonical mount lives in?
 is_mounted_at() {
-  awk -v p="$1" '$5 == p { found = 1 } END { exit !found }' "$(mountinfo_file)"
+  is_mounted_in "$(mountinfo_file)" "$1"
+}
+
+# Is <path> a FUSE mount according to the mount table <file>?
+#
+# Same field layout as fuse_minors_for below: the filesystem type is the
+# field just past the " - " separator. A bind mount of a file inside a
+# fuse.lxcfs mount reports that same type, which is what makes this a
+# drop-in for the old `mount -t fuse.lxcfs | grep` test.
+is_fuse_mounted_in() {
+  awk -v p="$2" '
+    {
+      fstype = ""
+      for (i = 7; i <= NF; i++)
+        if ($i == "-") { fstype = $(i + 1); break }
+      if ($5 == p && fstype ~ /^fuse/) found = 1
+    }
+    END { exit !found }
+  ' "$1"
 }
 
 # Minor device number of every FUSE connection mounted at <path>, topmost
@@ -298,14 +382,34 @@ host_umount_lazy() {
   nsenter -t 1 -m -- umount -lv "$1"
 }
 
-# Bounded `test -e <path>` inside a container's mount namespace.
+# Does <path> exist, as seen from inside the container's mount namespace?
+#
+# A function rather than an inline test because run_bounded backgrounds
+# "$@" and needs something to background.
+host_view_exists() {
+  [[ -e "$1" ]]
+}
+
+# Bounded existence check for <path> inside a container's mount namespace,
+# performed entirely from the host.
 #   0   path exists
 #   1   path does not exist
 #   124 probe timed out -> the FUSE mount is not answering
+#
+# /proc/<pid>/root is a magic symlink: the kernel resolves everything
+# below it against the target's root *and* the target's mount namespace,
+# so a stat there traverses exactly the mounts `test -e` inside the
+# container traversed -- including the LXCFS bind, and therefore the FUSE
+# server. Semantics are unchanged from the `nsenter -m -- test -e` this
+# replaces (existence, not readability), but no process runs in the
+# container, so it works in an image that contains no executables at all.
+#
+# It can still block, because a stat of a broken or wedged FUSE mount can,
+# which is why it stays inside run_bounded and never uses timeout(1).
 probe_path() {
   local container_pid=$1 path=$2 rc
 
-  run_bounded "$PROBE_TIMEOUT" nsenter -t "$container_pid" -m -- test -e "$path"
+  run_bounded "$PROBE_TIMEOUT" host_view_exists "/proc/${container_pid}/root${path}"
   rc=$?
 
   if [[ $rc -eq 124 ]]; then
@@ -318,16 +422,107 @@ probe_path() {
 }
 
 # Is <path> currently a fuse.lxcfs mount in this container?
+#   0  mounted
+#   1  not mounted
+#   2  could not find out
 #
-# Left unbounded on purpose: `mount -t <type>` only parses
-# /proc/self/mountinfo, it never stat()s the mount points, so it cannot
-# block on a wedged FUSE server. Keeping the pipeline shaped exactly as
-# before also keeps grep running on the host, so this works against
-# containers that ship no shell of their own.
+# Reads /proc/<pid>/mountinfo from the host. procfs renders the mount
+# table of whatever namespace that task is in, so this needs no process in
+# the container -- unlike the `nsenter -t <pid> -m -p -- mount -t
+# fuse.lxcfs | grep` it replaces, which could not work in a distroless
+# container at all: nsenter resolved `mount` in the target's filesystem,
+# found nothing, and the pipeline still exited 1 through grep, so the
+# caller was told "not mounted".
+#
+# Strictly better than the old form even where the old form worked: no
+# dependency, no fork of a mount(8) and a grep per path, and it cannot
+# block, because it parses a text file rather than stat()ing mount points.
+#
+# The third exit status is the point of this whole change. "I looked and
+# it is not there" and "I could not look" are different facts and the
+# caller must be able to act on the difference.
 is_lxcfs_mounted() {
   local container_pid=$1 path=$2
+  local file="/proc/${container_pid}/mountinfo"
 
-  nsenter -t "$container_pid" -m -p -- mount -t fuse.lxcfs | grep -qs "$path"
+  if [[ ! -r "$file" ]]; then
+    echo "WARN: cannot read '${file}'; unable to tell whether '${path}' is" \
+         "mounted in pid ${container_pid}" >&2
+    return 2
+  fi
+
+  is_fuse_mounted_in "$file" "$path"
+}
+
+# Which executable can run mount/umount inside pid <pid>, and how.
+#
+# Sets CT_MOUNT / CT_UMOUNT to a full argv prefix and CT_KIND to a label
+# for the log. Returns 1 when nothing is reachable, which the callers
+# report rather than swallow.
+#
+# busybox first, always: it is the one option that does not depend on the
+# workload's image. Both candidates are located by stat()ing the
+# container's filesystem through /proc/<pid>/root from the host, so an
+# absent tool is discovered before anything is exec'd instead of showing
+# up as an exec failure afterwards. Those stats traverse the container's
+# root filesystem and the node's /var/lib/lxc -- never the LXCFS mount --
+# so they cannot block on a wedged FUSE server.
+resolve_container_tools() {
+  local container_pid=$1
+  local root="/proc/${container_pid}/root" dir
+
+  CT_MOUNT=()
+  CT_UMOUNT=()
+  CT_KIND="none"
+
+  if [[ -x "${root}${CONTAINER_BUSYBOX}" ]]; then
+    CT_KIND="busybox (${CONTAINER_BUSYBOX})"
+    # No -p. busybox needs nothing from /proc for a bind or a umount, and
+    # entering one namespace instead of two is one failure mode fewer.
+    CT_MOUNT=(nsenter -t "$container_pid" -m -- "$CONTAINER_BUSYBOX" mount)
+    CT_UMOUNT=(nsenter -t "$container_pid" -m -- "$CONTAINER_BUSYBOX" umount)
+    return 0
+  fi
+
+  for dir in "${CONTAINER_TOOL_DIRS[@]}"; do
+    [[ -x "${root}${dir}/mount" && -x "${root}${dir}/umount" ]] || continue
+    CT_KIND="container's own (${dir})"
+    # -m -p, as 0.4.0 used for umount: util-linux's umount canonicalizes
+    # its argument against /proc/self/mountinfo, and /proc inside the
+    # container belongs to the container's PID namespace, so /proc/self
+    # only resolves for a task that is in it.
+    CT_MOUNT=(nsenter -t "$container_pid" -m -p -- "${dir}/mount")
+    CT_UMOUNT=(nsenter -t "$container_pid" -m -p -- "${dir}/umount")
+    return 0
+  done
+
+  return 1
+}
+
+# Say why an in-container command failed, in the caller's terms.
+#
+# nsenter exits 127 when it could not execute the program in the target's
+# mount namespace and 126 when it found it but could not run it. That is
+# precisely the status 0.4.0 discarded, and discarding it is what made a
+# distroless container indistinguishable from a container with nothing to
+# do.
+describe_exec_failure() {
+  local rc=$1 container_pid=$2 what=$3
+
+  case $rc in
+  124)
+    echo "ERROR: ${what} in pid ${container_pid} did not finish within" \
+         "${ACTION_TIMEOUT}s" >&2
+    ;;
+  126 | 127)
+    echo "ERROR: could not execute ${what} inside pid ${container_pid}" \
+         "(nsenter exit ${rc}). Nothing runnable is reachable in that" \
+         "container's mount namespace." >&2
+    ;;
+  *)
+    echo "ERROR: ${what} in pid ${container_pid} failed with exit ${rc}" >&2
+    ;;
+  esac
 }
 
 # umount that survives a dead mount. A plain umount of a wedged FUSE mount
@@ -338,19 +533,73 @@ is_lxcfs_mounted() {
 # per-container work off from the reserve kept for the host mount, and for
 # --remount is far enough out to leave the original per-operation
 # behaviour untouched.
+#
+# Requires resolve_container_tools() to have run for this pid. -v is gone
+# from both rungs: busybox's umount does not document it, and the echo
+# above the call already records what ran.
 bounded_umount() {
-  local container_pid=$1 path=$2
+  local container_pid=$1 path=$2 rc
 
-  echo nsenter -t "$container_pid" -m -p -- umount -v "$path"
-  if run_bounded_until "$BIND_DEADLINE" "$ACTION_TIMEOUT" \
-       nsenter -t "$container_pid" -m -p -- umount -v "$path"; then
+  echo "${CT_UMOUNT[@]}" "$path"
+  run_bounded_until "$BIND_DEADLINE" "$ACTION_TIMEOUT" "${CT_UMOUNT[@]}" "$path"
+  rc=$?
+  if ((rc == 0)); then
     return 0
   fi
+  describe_exec_failure "$rc" "$container_pid" "umount of '${path}'"
 
   echo "WARN: umount of '$path' in pid $container_pid did not succeed;" \
        "retrying lazily (umount -l)" >&2
-  run_bounded_until "$BIND_DEADLINE" "$ACTION_TIMEOUT" \
-    nsenter -t "$container_pid" -m -p -- umount -lv "$path"
+  run_bounded_until "$BIND_DEADLINE" "$ACTION_TIMEOUT" "${CT_UMOUNT[@]}" -l "$path"
+}
+
+# Bind <source> over <target> inside pid <pid>, read-only, and verify it.
+#
+# Requires resolve_container_tools() to have run for this pid.
+#
+# Two calls rather than one `mount -B -o ro`. mount(2) ignores MS_RDONLY
+# on a bind -- the new mount inherits the source's rw/ro -- so read-only
+# needs a second, MS_REMOUNT|MS_BIND|MS_RDONLY call. util-linux hides that
+# by issuing the remount for you; busybox does not, and its `mount -o
+# bind,ro` yields a read-write mount. Spelling both steps out makes the
+# result identical whichever tool ran. `-o bind` and the two-argument
+# `-o remount,bind,ro` are the spellings both tools accept; -B and -v are
+# util-linux-only, which is why 0.4.0's `mount -B` also failed on every
+# Alpine-based container, whose busybox mount rejects it.
+#
+# nosuid,nodev are named explicitly because a remount replaces the mount's
+# flags with exactly what it is given: asking only for `ro` drops them.
+# 0.4.0's `mount -B -o ro` dropped them too, so this is not a regression
+# but a small correction -- the LXCFS mount they come from carries them
+# (libfuse mounts nosuid,nodev), and so do the equivalent mounts kubelet
+# makes at Pod creation, which means a bind restored here is now
+# indistinguishable from the one it replaces.
+CONTAINER_BIND_OPTS="remount,bind,ro,nosuid,nodev"
+
+container_bind_ro() {
+  local container_pid=$1 source=$2 target=$3 rc
+
+  echo "${CT_MOUNT[@]}" -o bind "$source" "$target"
+  run_bounded "$ACTION_TIMEOUT" "${CT_MOUNT[@]}" -o bind "$source" "$target"
+  rc=$?
+  if ((rc != 0)); then
+    describe_exec_failure "$rc" "$container_pid" "bind of '${target}'"
+    return 1
+  fi
+
+  if ! run_bounded "$ACTION_TIMEOUT" \
+         "${CT_MOUNT[@]}" -o "$CONTAINER_BIND_OPTS" "$target" "$target"; then
+    echo "WARN: pid ${container_pid}: '${target}' is bound but could not be" \
+         "remounted read-only, so it stays writable. LXCFS ignores writes, so" \
+         "this is cosmetic, but it is not what this script asked for." >&2
+    REMOUNT_DEGRADED+=("pid ${container_pid}: ${target}: bound read-write")
+  fi
+
+  # Assert the end state rather than trust the exit status. A mount that
+  # reports success while the path is absent from the container's mount
+  # table is exactly the silent failure this release exists to remove, and
+  # the check is a text-file parse, so it costs nothing.
+  is_lxcfs_mounted "$container_pid" "$target"
 }
 
 # Tear down the canonical LXCFS FUSE mount in the host mount namespace.
@@ -559,8 +808,21 @@ Environment
                         ${LXCFS_PATH}, which the per-container loop may
                         not spend (default: ${HOST_TEARDOWN_RESERVE})
 
---remount exits non-zero if any probe times out, so a wedged mount shows
-up as FailedPostStartHook instead of hanging the hook forever.
+--remount exits non-zero if any probe times out, or if it could not do
+work it was supposed to do -- a bind that did not take effect, a container
+whose mount table could not be read, a container with nothing runnable
+inside it -- so a broken node shows up as FailedPostStartHook instead of
+hanging the hook forever or reporting success while doing nothing. A
+container that simply exited mid-scan is reported but does not fail the
+hook.
+
+The mount and umount that must run inside a mutated container are executed
+via the statically linked busybox this image stages at
+${CONTAINER_BUSYBOX}, which is reachable inside every mutated Pod because
+the webhook bind-mounts ${LXC_PATH}/ into it. The container's own
+mount/umount is used when that is missing. Nothing else runs inside the
+container any more: existence probes go through /proc/<pid>/root and mount
+table lookups through /proc/<pid>/mountinfo, both from the node.
 
 --umount also detaches the canonical FUSE mount at ${LXCFS_PATH}. That
 mount is created with Bidirectional propagation, so it lives in the host
@@ -591,27 +853,74 @@ pre_check() {
     echo container cli command crictl or docker not found on host, exit
     exit 1
   fi
+
+  # Not fatal -- resolve_container_tools() falls back to the container's
+  # own mount/umount and reports per container when neither exists -- but
+  # a node missing the staged busybox cannot serve a distroless container,
+  # and that is worth one line at the top of the hook log rather than
+  # eight lines per Pod further down.
+  if [[ ! -x "$CONTAINER_BUSYBOX" ]]; then
+    echo "WARN: '${CONTAINER_BUSYBOX}' is missing or not executable on this node." \
+         "Containers whose image ships no mount/umount of its own cannot be" \
+         "served. It is staged by this image's entrypoint, so a node in this" \
+         "state is running an lxcfs image older than 7.0.0-2." >&2
+  fi
+}
+
+# The eight files LXCFS virtualizes, i.e. the bind mounts the webhook
+# injects (cmd/volume.go) and the ones this script maintains.
+LXCFS_TARGETS=(
+  "/proc/cpuinfo"
+  "/proc/diskstats"
+  "/proc/loadavg"
+  "/proc/meminfo"
+  "/proc/stat"
+  "/proc/swaps"
+  "/proc/uptime"
+  "/sys/devices/system/cpu/online"
+)
+
+# Is the container still there?
+#
+# A container that exited between discovery and now is normal churn, not a
+# defect: `crictl ps` and `docker ps` are snapshots and kubelet is always
+# moving Pods. Distinguishing it from a real failure matters because only
+# one of the two should make the hook exit non-zero. /proc is procfs, so
+# this cannot block.
+container_alive() {
+  [[ -d "/proc/${1}" ]]
 }
 
 # remount fuse.lxcfs filesystem in container
 # if fuse.lxcfs mount point is broken in container, umount and mount it again
 # if mount point is ok and fuse.lxcfs filesystem mount in container, mount it again
 lxcfs_remount() {
-  container_pid=$1
+  local container_pid=$1
 
-  local targets=(
-    "/proc/cpuinfo"
-    "/proc/diskstats"
-    "/proc/loadavg"
-    "/proc/meminfo"
-    "/proc/stat"
-    "/proc/swaps"
-    "/proc/uptime"
-    "/sys/devices/system/cpu/online"
-  )
+  if ! container_alive "$container_pid"; then
+    echo "WARN: pid ${container_pid} no longer exists; nothing to remount" >&2
+    UNREACHABLE_CONTAINERS+=("pid ${container_pid}: exited before it could be remounted")
+    return 0
+  fi
 
-  local target source rc
-  for target in "${targets[@]}"; do
+  if ! resolve_container_tools "$container_pid"; then
+    {
+      echo "ERROR: pid ${container_pid} has no reachable mount/umount, so its"
+      echo "       LXCFS bind mounts cannot be restored. Looked for"
+      echo "       '${CONTAINER_BUSYBOX}' (staged by this image's entrypoint into"
+      echo "       ${LXCFS_SCRIPT_PATH}, which the webhook bind-mounts into every"
+      echo "       mutated Pod) and for mount+umount in ${CONTAINER_TOOL_DIRS[*]}."
+      echo "       Either this node's ${LXCFS_SCRIPT_PATH} predates chart 0.4.1,"
+      echo "       or the Pod does not carry the /var/lib/lxc/ mount."
+    } >&2
+    UNTOOLED_CONTAINERS+=("pid ${container_pid}")
+    REMOUNT_FAILED+=("pid ${container_pid}: no mount tool reachable inside the container")
+    return 1
+  fi
+  echo "INFO: pid ${container_pid}: in-container mount tool = ${CT_KIND}"
+
+  local target source rc mrc
+  for target in "${LXCFS_TARGETS[@]}"; do
     source="${LXCFS_PATH}${target}"
 
     # The in-container mount point is present in the mount table but no
@@ -623,8 +932,25 @@ lxcfs_remount() {
     # it is what lets the container recover.
     probe_path "$container_pid" "$target"
     rc=$?
-    if [[ $rc -ne 0 ]] && is_lxcfs_mounted "$container_pid" "$target"; then
-      bounded_umount "$container_pid" "$target"
+    if ((rc != 0)); then
+      is_lxcfs_mounted "$container_pid" "$target"
+      mrc=$?
+      case $mrc in
+      0)
+        if ! bounded_umount "$container_pid" "$target"; then
+          # Not fatal on its own: the bind below may still land on top of
+          # it and the topmost mount is the one the container reads. The
+          # verification at the end of container_bind_ro decides.
+          echo "WARN: pid ${container_pid}: could not detach the stale bind at" \
+               "'${target}'; a new bind will be stacked over it" >&2
+          REMOUNT_DEGRADED+=("pid ${container_pid}: ${target}: stale bind not detached")
+        fi
+        ;;
+      2)
+        REMOUNT_FAILED+=("pid ${container_pid}: ${target}: could not read the container's mount table")
+        continue
+        ;;
+      esac
     fi
 
     # Bind the canonical LXCFS file over the container's, but only once
@@ -632,11 +958,41 @@ lxcfs_remount() {
     # source first is the whole point: a mount that merely *exists* proves
     # nothing, and bind-mounting a wedged source spreads the hang into
     # every mutated container on the node.
-    if probe_path "$container_pid" "$source" &&
-       ! is_lxcfs_mounted "$container_pid" "$target"; then
-      echo nsenter -t "$container_pid" -m -- mount -B -v -o ro "$source" "$target"
-      run_bounded "$ACTION_TIMEOUT" \
-        nsenter -t "$container_pid" -m -- mount -B -v -o ro "$source" "$target"
+    probe_path "$container_pid" "$source"
+    rc=$?
+    if ((rc == 124)); then
+      REMOUNT_FAILED+=("pid ${container_pid}: ${target}: source '${source}' did not answer")
+      continue
+    fi
+    if ((rc != 0)); then
+      # Not a hard failure: LXCFS may not have created this file (an
+      # --enable-* flag it was not given), in which case leaving the
+      # container on the host's file is correct. Say so, because 0.4.0
+      # reached this branch for *every* path in a distroless container and
+      # printed nothing.
+      REMOUNT_ABSENT=$((REMOUNT_ABSENT + 1))
+      echo "WARN: pid ${container_pid}: '${source}' does not exist, so" \
+           "'${target}' is left as the node's own" >&2
+      continue
+    fi
+
+    is_lxcfs_mounted "$container_pid" "$target"
+    mrc=$?
+    if ((mrc == 0)); then
+      REMOUNT_ALREADY=$((REMOUNT_ALREADY + 1))
+      continue
+    fi
+    if ((mrc == 2)); then
+      REMOUNT_FAILED+=("pid ${container_pid}: ${target}: could not read the container's mount table")
+      continue
+    fi
+
+    if container_bind_ro "$container_pid" "$source" "$target"; then
+      REMOUNT_BOUND=$((REMOUNT_BOUND + 1))
+    else
+      echo "ERROR: pid ${container_pid}: '${target}' is still not an LXCFS mount" \
+           "after binding '${source}' over it (tool: ${CT_KIND})" >&2
+      REMOUNT_FAILED+=("pid ${container_pid}: ${target}: bind did not take effect")
     fi
   done
 }
@@ -647,21 +1003,28 @@ lxcfs_remount() {
 # goal is to detach them, and probing a dead mount is exactly what used to
 # make preStop block until the node was rebooted.
 lxcfs_umount() {
-  container_pid=$1
+  local container_pid=$1
 
-  local targets=(
-    "/proc/cpuinfo"
-    "/proc/diskstats"
-    "/proc/loadavg"
-    "/proc/meminfo"
-    "/proc/stat"
-    "/proc/swaps"
-    "/proc/uptime"
-    "/sys/devices/system/cpu/online"
-  )
+  if ! container_alive "$container_pid"; then
+    echo "WARN: pid ${container_pid} no longer exists; nothing to unmount" >&2
+    return 0
+  fi
 
-  local target
-  for target in "${targets[@]}"; do
+  # A container with nothing runnable inside keeps its binds. That is
+  # recoverable -- they answer ENOTCONN once the connection is aborted and
+  # the next Pod's postStart replaces them -- but it must be said out
+  # loud, because in 0.4.0 this was the silent path for every distroless
+  # container on the node.
+  if ! resolve_container_tools "$container_pid"; then
+    echo "WARN: pid ${container_pid} has no reachable umount; leaving its LXCFS" \
+         "bind mounts in place. They will answer ENOTCONN until the next" \
+         "postStart --remount replaces them." >&2
+    UNTOOLED_CONTAINERS+=("pid ${container_pid}")
+    return 1
+  fi
+
+  local target mrc
+  for target in "${LXCFS_TARGETS[@]}"; do
     # Out of the bind-mount slice of the budget. Stop rather than keep
     # spending: what is left is reserved for the canonical host mount,
     # which is the part a human cannot recover from remotely. The binds
@@ -673,8 +1036,13 @@ lxcfs_umount() {
       continue
     fi
 
-    if is_lxcfs_mounted "$container_pid" "$target"; then
+    is_lxcfs_mounted "$container_pid" "$target"
+    mrc=$?
+    if ((mrc == 0)); then
       bounded_umount "$container_pid" "$target"
+    elif ((mrc == 2)); then
+      echo "WARN: pid ${container_pid}: leaving '${target}' alone; its mount" \
+           "table could not be read" >&2
     fi
   done
 }
@@ -848,6 +1216,52 @@ main() {
              "bind mount(s) were left in place. They read ENOTCONN rather than" \
              "hanging, and the next Pod's postStart --remount replaces them."
       fi
+      if ((${#UNTOOLED_CONTAINERS[@]} > 0)); then
+        echo "WARN: ${#UNTOOLED_CONTAINERS[@]} container(s) kept their bind mounts" \
+             "because nothing executable was reachable inside them:" \
+             "${UNTOOLED_CONTAINERS[*]}"
+      fi
+    } >&2
+  fi
+
+  # --remount closing report.
+  #
+  # Always printed, including on a completely healthy run, because the
+  # thing that made the distroless bug survive 75 days was a hook log that
+  # said nothing at all. A one-line tally makes "did no work" visibly
+  # different from "had no work to do".
+  if [[ "$REMOUNT" == true ]]; then
+    {
+      echo "INFO: remount finished in $((SECONDS - started_at))s:" \
+           "${REMOUNT_BOUND} bound, ${REMOUNT_ALREADY} already mounted," \
+           "${REMOUNT_ABSENT} source(s) absent, ${#REMOUNT_FAILED[@]} failed"
+      if ((${#UNREACHABLE_CONTAINERS[@]} > 0)); then
+        echo "INFO: skipped ${#UNREACHABLE_CONTAINERS[@]} container(s) that exited" \
+             "mid-scan: ${UNREACHABLE_CONTAINERS[*]}"
+      fi
+      if ((${#REMOUNT_DEGRADED[@]} > 0)); then
+        printf 'WARN: %s\n' "${REMOUNT_DEGRADED[@]}"
+      fi
+      if ((${#REMOUNT_FAILED[@]} > 0)); then
+        echo
+        echo "==================================================================="
+        echo "LXCFS bind mounts could not be restored on $(hostname)."
+        echo
+        printf '  - %s\n' "${REMOUNT_FAILED[@]}"
+        echo
+        if ((${#UNTOOLED_CONTAINERS[@]} > 0)); then
+          echo "Containers with nothing runnable inside them (distroless) need"
+          echo "'${CONTAINER_BUSYBOX}' on the node. It is staged by this image's"
+          echo "entrypoint, so check that the DaemonSet is running lxcfs 7.0.0-2"
+          echo "or newer and that the Pod carries the ${LXC_PATH}/ mount the"
+          echo "webhook injects."
+          echo
+        fi
+        echo "Until this is fixed those containers read the node's /proc, not"
+        echo "their cgroup's. See charts/lxcfs-admission-webhook/MIGRATION.md"
+        echo "(0.4.0 -> 0.4.1)."
+        echo "==================================================================="
+      fi
     } >&2
   fi
 
@@ -899,6 +1313,14 @@ main() {
     if [[ "$REMOUNT" == true ]]; then
       exit 1
     fi
+  fi
+
+  # Same reasoning for work that could not be completed for any other
+  # reason. A container that merely exited mid-scan is deliberately not in
+  # REMOUNT_FAILED: one Pod moving must not fail the hook for the whole
+  # node, whereas a bind that did not take effect must.
+  if [[ "$REMOUNT" == true ]] && ((${#REMOUNT_FAILED[@]} > 0)); then
+    exit 1
   fi
 
   # A preStop that could not clear the host mount surfaces as
