@@ -1,5 +1,294 @@
 # Migration guide
 
+## 0.4.1 -> 0.4.2 (the postStart hook stops racing its own entrypoint)
+
+Image-and-chart, no webhook change: `lxcfs.image.tag` moves from `7.0.0-2`
+to `7.0.0-3`, the DaemonSet gains a `readinessProbe` and an explicit
+`updateStrategy`, and its postStart hook gains a first stage. New values,
+all with working defaults: `lxcfs.readinessProbe.*` and
+`lxcfs.updateStrategy`.
+
+### What broke
+
+`0.4.1` fixed the bind logic correctly and then failed to run it. On the
+production roll from `7.0.0-1` to `7.0.0-2`, three Alpine-based
+`nginx-unprivileged` containers with a 128Mi limit came out of the roll
+reporting the **node's** 65600692 kB instead of 131072 kB. Running the same
+hook by hand minutes later fixed all of them:
+
+```
+nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --remount
+INFO: remount finished in 24s: 48 bound, 24 already mounted, 48 source(s) absent, 0 failed
+```
+
+`48 bound` is the tell: postStart should already have bound those paths, in
+which case the manual run would have called them *already mounted*.
+
+**kubelet runs postStart concurrently with the container's ENTRYPOINT and
+guarantees no ordering between them.** The hook then runs
+`/var/lib/lxc/script/lxcfs-mount.sh` — a file on the node's hostPath, put
+there by the release being *replaced*, which this container's entrypoint is
+concurrently overwriting. Two independent defects follow, both reproduced
+by driving real container lifecycles on a Docker-in-Docker node (the hook
+fired the way kubelet fires it, immediately on container start, racing the
+entrypoint):
+
+| | Measured |
+|---|---|
+| canonical mount absent from the mount table at hook entry | 3 of 3 rolls |
+| staged `lxcfs-mount.sh` still the previous release's copy at hook entry | 3 of 3 rolls |
+| mutated Alpine container reading the node's `MemTotal` after the roll | 6 of 6 rolls |
+| postStart exit code on those rolls | `0` — silent |
+
+1. **The hook ran the outgoing release's script.** In 5 of 6 rolls the log
+   showed `mount -B -v -o ro` — `0.4.0`'s invocation, which `0.4.1`
+   replaced precisely because `-B` is util-linux-only and every
+   Alpine-based container rejects it. So `0.4.1`'s fix did not take effect
+   on the roll that deployed it: the `debian`-based workload was served
+   (util-linux accepts `-B`), the Alpine one was not, and the hook still
+   exited 0. That split by image family, not by timing, is what the
+   production numbers show too — 6 containers the manual run had to bind,
+   3 it found already bound.
+
+2. **Worse, the two versions could be spliced together.** `cat src > dst`
+   truncates in place, and bash does not read a script in one gulp — it
+   reads, executes, and comes back at a saved offset. Rewriting the file
+   underneath a running bash therefore executes a mixture. Observed:
+   `tool: busybox ()` — `0.4.1`'s `resolve_container_tools` running against
+   `0.4.0`'s variable block, so `$CONTAINER_BUSYBOX` was empty and every
+   `nsenter` exited 127 — and a tally line printed with empty counters. The
+   mechanism, isolated:
+
+   ```
+   rewrite in place -> prologue said VERSION=old, epilogue belongs to new
+   rename(2)        -> prologue said VERSION=old, epilogue belongs to old
+   ```
+
+3. **The only synchronisation with the daemon was `sleep 3`** — a timer,
+   not a fact, and one with no failure mode. When it guessed wrong, every
+   source file looked absent, every container was skipped, and the hook
+   exited **0**. Against a node whose mount is not up, `0.4.1` prints 24
+   `does not exist, so … is left as the node's own` warnings and returns
+   success; `0.4.2` refuses and exits 1.
+
+Separately, `0.4.1` cried wolf. A container with no `/var/lib/lxc` mount in
+its namespace was never an LXCFS consumer and can never be bound — but the
+source probe resolves through `/proc/<pid>/root`, so such a container
+reported all eight sources absent. On the production node that was six
+`istio-proxy` sidecars, i.e. **48 warnings per roll that mean nothing**.
+Worse, `resolve_container_tools` ran *before* that was noticed, so a
+sidecar that is both distroless and not a consumer landed in
+`REMOUNT_FAILED` and failed the whole node's hook. Reproduced: a distroless
+non-consumer gives `REMOUNT_FAILED entries: 1` under `0.4.1` and `0` under
+`0.4.2`.
+
+### The fix
+
+**1. `entrypoint.sh` stages atomically.** `lxcfs-mount.sh` is now written
+to a temporary file and `rename(2)`d into place, the treatment the staged
+busybox already got (truncating a running binary gets `ETXTBSY`). A reader
+sees either the old inode, complete and never modified, or the new one —
+never a splice.
+
+**2. The postStart hook has two stages, and the order is the fix.**
+
+```yaml
+postStart:
+  exec:
+    command:
+      - /bin/bash
+      - -c
+      - /lxcfs/lxcfs-ready.sh --wait && nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --remount
+```
+
+Stage one runs from **the image**, where it cannot be stale, and returns
+only once two facts hold: the staged `lxcfs-mount.sh` and `busybox` are
+byte-identical to this image's, and a read of
+`/var/lib/lxc/lxcfs/proc/cpuinfo` through the mount **answers**. Stage two
+is then guaranteed to be the current script running against a serving
+mount. If stage one gives up, `&&` short-circuits and the hook fails, which
+surfaces as `FailedPostStartHook`.
+
+`--remount` also gates internally, so a manual run — or a hook command from
+an older chart — gets the same guarantee instead of silently skipping every
+container. On a healthy roll that second gate returns on its first poll.
+
+Note what "serving" has to mean. The `7.0.0` defect answers `lookup` and
+`getattr` on the mount root instantly and hangs only in `read()` of the
+cpuview-backed files, so `mountpoint`, `stat` and `test -d` all report
+success on a mount that will hang every consumer it is bound into.
+Measured healthy start-up on an idle node: **~0.2s** from container start to
+`/proc/cpuinfo` answering.
+
+**3. Three buckets instead of one.** `container_is_consumer()` reads
+`/proc/<pid>/mountinfo` — no exec, nothing that can block — and asks
+whether the webhook ever injected into this container: does it carry
+`/var/lib/lxc` (`cmd/volume.go`'s ninth mount, which survives preStop
+removing the eight binds), or does it still have an LXCFS bind (which
+covers a Pod mutated by a webhook older than that ninth mount)? Neither
+means it is not a consumer, which is an ordinary skip. Asked *before*
+anything is exec'd, so a distroless non-consumer can no longer fail the
+hook.
+
+| Case | `0.4.1` | `0.4.2` |
+|---|---|---|
+| container the webhook never injected into | 8 warnings each, counted as `source(s) absent` | counted as `container(s) not LXCFS consumers`, listed once, silent per container |
+| LXCFS does not serve the file on this node | same warning, same bucket | counted as `not served by lxcfs`, named once for the node. Empty on `7.0.0`: all eight paths exist whatever `lxcfs.args` says |
+| LXCFS serves it and the container cannot see it | same warning, exit 0 | **`ERROR`, counted as failed, exits non-zero** |
+
+The tally changed shape:
+
+```
+# 0.4.1, healthy node with six sidecars
+INFO: remount finished in 24s: 48 bound, 24 already mounted, 48 source(s) absent, 0 failed
++ 48 x WARN: ... does not exist, so ... is left as the node's own
+
+# 0.4.2, same node
+INFO: remount finished in 2s: 48 bound, 24 already mounted, 0 not served by lxcfs, 6 container(s) not LXCFS consumers, 0 failed
+```
+
+One consequence worth knowing: a Pod that *should* be a consumer but has
+lost its `/var/lib/lxc` mount is now reported as a non-consumer rather than
+warned about. It was not a failure in `0.4.1` either — it went into the
+same `source(s) absent` bucket and exited 0 — so nothing regressed, but the
+authoritative check is the Pod spec, not the hook log:
+
+```sh
+kubectl get pod <pod> -o jsonpath='{.spec.containers[*].volumeMounts[?(@.mountPath=="/var/lib/lxc/")].name}'
+```
+
+**4. `Ready` now means the mount serves.** The DaemonSet gets a
+`readinessProbe` that reads a cpuview-backed file through the mount:
+
+```yaml
+lxcfs:
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+```
+
+During the `7.0.0` incident a Pod reported `1/1 Running` on a node where
+every read through its mount hung forever, and the rolling update moved on
+to the second node and wrecked that one too. With `maxUnavailable: 1` — now
+spelled out in the template rather than left to the API default — a failing
+probe stops the roll where it is.
+
+### Why those probe numbers are safe
+
+- **`timeoutSeconds: 5` against a slow-but-healthy node.** A healthy read
+  of `/proc/cpuinfo` through the mount costs microseconds of CPU; measured
+  round trip including the exec is 0.1s. The DaemonSet's `500m` limit
+  throttles at a 100 ms period, so even a fully throttled daemon completes
+  a request within one period. Five seconds is about four orders of
+  magnitude of headroom. The script's own read deadline is derived as
+  `max(1, timeoutSeconds - 2)` = 3s so that it always returns its own
+  verdict, with a reason, rather than being killed and reported as an
+  opaque probe timeout.
+- **`failureThreshold: 3`, `periodSeconds: 10`, `initialDelaySeconds: 5`.**
+  Three *consecutive* failures are needed, so a Pod is marked NotReady
+  after ~35s. Healthy start-up is ~0.2s, and the early probes that run
+  before the mount exists fail on a mount-table parse without touching the
+  filesystem at all, so they cost nothing.
+- **The probe cannot hang.** It never reads in the foreground:
+  `lxcfs-ready.sh` backgrounds the read and polls. `timeout(1)` is not
+  usable here — it would signal a task in uninterruptible sleep that cannot
+  run to take the signal, and then block in `wait()` itself.
+- **The probe cannot leak processes.** A read that parks is recorded (pid
+  plus `/proc/<pid>/stat` start time, so pid reuse cannot fool it) *before*
+  the wait, and while that task still exists no further read is started.
+  **At most one parked task per container instance**, however long the
+  mount stays wedged — versus one per period for a naive
+  `exec: [cat, …]` probe, which is the accumulation that turned a
+  pod-level defect into a node-level one. The record clears itself as soon
+  as the task is gone, so recovery needs no manual step. Measured, with
+  the daemon stopped so the mount stops answering:
+
+  ```
+  probe: rc=1 in 4.2s   <- fails, names the parked reader, does not hang
+  probe: rc=1 in 0.1s   <- refuses to start a second read
+  probe: rc=1 in 0.1s
+  probe: rc=1 in 0.1s
+  (daemon resumed)
+  probe: rc=0 in 0.1s   <- ready again, marker cleared automatically
+  ```
+
+### Grace period arithmetic
+
+The gate is derived from the same value as the teardown budget, so the two
+cannot drift:
+
+```
+terminationGracePeriodSeconds     60
+LXCFS_MOUNT_READY_TIMEOUT         45   = max(10, 60 - 15)   postStart gate
+LXCFS_UMOUNT_BUDGET               45   = max(5,  60 - 15)   preStop teardown
+  mandatory teardown rungs        13   = probe 5 + abort 3 + lazy detach 5
+```
+
+Start-up and termination are different phases of the same container and
+never run at the same time. The only interleaving is a DELETE that lands
+while the gate is still open: kubelet's per-Pod worker finishes the hook
+before it starts killing, so the teardown begins up to 45s late. That is
+survivable precisely because **the gate only stays open while the mount is
+not serving**, and in that state the teardown is either
+`none (not a mount point)` — a no-op — or the 13s mandatory ladder.
+`45 + 13 = 58 <= 60`, so even the worst interleaving fits inside one grace
+period, for any grace period, since both sides are derived from it.
+
+`LXCFS_MOUNT_READY_TIMEOUT` can be overridden as a container env var if a
+node genuinely needs longer; keep it below
+`terminationGracePeriodSeconds - 13`.
+
+### Upgrade steps
+
+1. Bump the chart to `0.4.2`. `lxcfs.image.tag` moves to `7.0.0-3`
+   automatically.
+2. Verify the image first. `verify-lxcfs.sh image` now also asserts that
+   the gate fails on a file that never answers and that the probe refuses
+   to start a second read while one is parked:
+   ```sh
+   ./lxcfs-image/verify-lxcfs.sh image ghcr.io/idoyo7/lxcfs:7.0.0-3
+   ```
+3. Roll one node and read the DaemonSet Pod's log. A healthy node prints
+   one `is serving; '/var/lib/lxc/lxcfs/proc/cpuinfo' answered after 0s`
+   line and a tally whose last two fields are
+   `N container(s) not LXCFS consumers, 0 failed`. It should print **no**
+   `does not exist, so … is left as the node's own` lines at all — that
+   message is gone.
+4. Confirm the Pod goes Ready, which now means something:
+   ```sh
+   kubectl -n <ns> get pod -l app=<release>-daemonset
+   kubectl -n <ns> exec <lxcfs-pod> -- /lxcfs/lxcfs-ready.sh; echo $?
+   ```
+5. Check the containers that were broken before. For an Alpine or
+   distroless workload with a 128Mi limit, `MemTotal` must be `131072 kB`,
+   not the node's:
+   ```sh
+   kubectl exec <pod> -- /var/lib/lxc/script/busybox head -1 /proc/meminfo
+   ```
+
+**This upgrade's own roll is safe with the old hook.** `0.4.1`'s staged
+script can serve all three image families, so even when the roll runs it
+(the window this release closes) the outcome is correct — verified: the
+`7.0.0-2 -> 7.0.0-3` roll came out with all three workloads virtualized
+either way. The fix matters for every *future* release that changes
+`lxcfs-mount.sh`, and for the splice, which can corrupt any roll.
+
+### One thing this release does not do
+
+There is deliberately no `livenessProbe`. Killing the container on a wedged
+mount races the preStop teardown ladder and can loop: the new container's
+`entrypoint.sh` refuses to start on a mount it could not clear, so a
+restart may CrashLoopBackOff instead of recovering. Readiness plus a halted
+roll plus an alert is the chosen behaviour; when a human or kubelet does
+remove the Pod, preStop performs the abort-and-detach recovery.
+
 ## 0.4.0 -> 0.4.1 (restores LXCFS in containers that ship no `mount`)
 
 Image-and-scripts only. `values.yaml`, the templates and the webhook

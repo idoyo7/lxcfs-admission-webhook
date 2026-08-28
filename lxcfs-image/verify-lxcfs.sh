@@ -189,6 +189,88 @@ if [ \$fail -eq 0 ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
 EOF
 }
 
+# The readiness / postStart-gate checks that run inside the container.
+#
+# What these gate, and why they are here rather than in a cluster
+# ---------------------------------------------------------------
+# Chart 0.4.1's postStart hook synchronised with the daemon it depends on
+# by sleeping 3 seconds, and ran a copy of lxcfs-mount.sh from the node's
+# hostPath that its own entrypoint was concurrently rewriting in place. So
+# on a roll the hook ran the OUTGOING release's script -- or a splice of
+# the two, because bash reads a script incrementally -- and when it guessed
+# wrong about the mount it found every source absent, skipped every
+# container and exited 0.
+#
+# 0.4.2 answers both with facts instead of a timer: lxcfs-ready.sh returns
+# only once the mount answers a read AND the staged files match this
+# image's. These checks assert the properties that fix depends on, including
+# the two that are easy to lose in a refactor: that the gate FAILS on a file
+# that does not answer, and that the probe never starts a second read while
+# an earlier one is still parked -- which is what keeps a wedged mount from
+# accumulating one unkillable task per probe period.
+readiness_script() {
+  cat <<'EOF'
+fail=0
+step() { printf '  %-7s %s\n' "$1" "$2"; [ "$1" = FAIL ] && fail=1; return 0; }
+
+if [ -x /lxcfs/lxcfs-ready.sh ]; then step ok "/lxcfs/lxcfs-ready.sh is executable"
+else step FAIL "/lxcfs/lxcfs-ready.sh is missing or not executable"; echo "VERDICT: FAIL"; exit 0; fi
+
+if /lxcfs/lxcfs-ready.sh; then step ok "readiness check passes against a serving mount"
+else step FAIL "readiness check failed against a serving mount"; fi
+
+if LXCFS_MOUNT_READY_TIMEOUT=10 /lxcfs/lxcfs-ready.sh --wait >/dev/null; then
+  step ok "postStart gate (--wait) returns success against a serving mount"
+else
+  step FAIL "postStart gate (--wait) failed against a serving mount"
+fi
+
+if cmp -s /lxcfs/lxcfs-mount.sh /var/lib/lxc/script/lxcfs-mount.sh; then
+  step ok "entrypoint staged lxcfs-mount.sh and it matches this image's copy"
+else
+  step FAIL "staged lxcfs-mount.sh differs from this image's copy"
+fi
+
+# The gate must give up non-zero rather than pass, or hang, when the file
+# it reads does not answer. A path that does not exist stands in for a
+# daemon that never mounted; a wedged one needs a real hang to reproduce.
+if LXCFS_MOUNT_READY_TIMEOUT=2 LXCFS_READY_PROBE_FILE=/proc/no-such-lxcfs-file \
+   /lxcfs/lxcfs-ready.sh --wait >/dev/null 2>&1; then
+  step FAIL "the gate reported success for a file that never answered"
+else
+  step ok "the gate fails non-zero when its probe file never answers"
+fi
+
+# The parked-reader guard: while a reader recorded earlier is still alive,
+# no further read may be started. Stood in for by any live process, since
+# the guard's test is "does that task still exist with that start time".
+rm -f /run/lxcfs-readiness-parked
+sleep 300 &
+guard=$!
+printf '%s %s\n' "$guard" "$(awk '{print $22}' "/proc/$guard/stat")" \
+  >/run/lxcfs-readiness-parked
+if /lxcfs/lxcfs-ready.sh >/dev/null 2>&1; then
+  step FAIL "the probe ran anyway with a parked reader recorded"
+else
+  step ok "the probe refuses to start a second read while one is parked"
+fi
+kill "$guard" 2>/dev/null
+wait "$guard" 2>/dev/null
+if /lxcfs/lxcfs-ready.sh >/dev/null 2>&1; then
+  step ok "readiness returns once the parked reader is gone"
+else
+  step FAIL "readiness stayed failed after the parked reader was gone"
+fi
+if [ -e /run/lxcfs-readiness-parked ]; then
+  step FAIL "the stale parked-reader marker was not cleared"
+else
+  step ok "the stale parked-reader marker was cleared"
+fi
+
+if [ $fail -eq 0 ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
+EOF
+}
+
 verify_image() {
   local image="" runtime=""
   while (($#)); do
@@ -270,6 +352,29 @@ verify_image() {
     echo "charts/lxcfs-admission-webhook/MIGRATION.md (0.4.0 -> 0.4.1)."
     return 1
   fi
+
+  echo
+  echo "readiness check and postStart mount-ready gate:"
+  local rd_out
+  rd_out=$(run_with_deadline $((READ_TIMEOUT * 6 + 30)) \
+           "$runtime" exec "$name" sh -c "$(readiness_script)")
+  local rd_rc=$?
+  echo "$rd_out"
+
+  if ((rd_rc == 124)); then
+    echo
+    echo "VERDICT: FAIL - the readiness checks never returned, which means one"
+    echo "of them blocked. Nothing in lxcfs-ready.sh is allowed to."
+    return 1
+  fi
+  if [[ $rd_out != *"VERDICT: PASS"* ]]; then
+    echo
+    echo "VERDICT: FAIL - this image's readiness check or postStart gate does"
+    echo "not behave as the chart's DaemonSet assumes. Without them the hook"
+    echo "races its own entrypoint and can restore nothing while reporting"
+    echo "success; see MIGRATION.md (0.4.1 -> 0.4.2)."
+    return 1
+  fi
   return 0
 }
 
@@ -278,16 +383,31 @@ cleanup_image() {
   echo
   echo "cleaning up container $name"
   # A wedged mount can leave unkillable readers holding the FUSE
-  # connection, so abort it before trying to remove the container.
-  "$runtime" exec "$name" sh -c '
-    mkdir -p /tmp/fusectl 2>/dev/null
-    mount -t fusectl none /tmp/fusectl 2>/dev/null
-    for c in /tmp/fusectl/*; do
-      w=$(cat "$c/waiting" 2>/dev/null || echo 0)
-      [ "${w:-0}" -gt 0 ] && echo 1 > "$c/abort"
-    done
-    umount /tmp/fusectl 2>/dev/null
-    true' >/dev/null 2>&1
+  # connection, so abort it before trying to remove the container --
+  # otherwise the container cannot be removed and the connection stays.
+  #
+  # The connection is resolved from the mount table by minor number, NEVER
+  # by sweeping fusectl for `waiting > 0`. fusectl is not namespaced: it
+  # lists every FUSE connection on the kernel, so on the machine running
+  # this check that sweep would also catch the container runtime's own
+  # mounts -- on a Mac or a Windows box, Docker Desktop's virtiofs/grpcfuse
+  # file sharing and Rosetta. Aborting one of those breaks the host, and it
+  # is precisely the connections with pending requests that get hit.
+  "$runtime" exec "$name" sh -c "$(cat <<EOF
+mkdir -p /tmp/fusectl 2>/dev/null
+mount -t fusectl none /tmp/fusectl 2>/dev/null
+minors=\$(awk -v p='${MOUNT_PATH}' '
+  { fstype = ""
+    for (i = 7; i <= NF; i++) if (\$i == "-") { fstype = \$(i + 1); break }
+    if (\$5 == p && fstype ~ /^fuse/) { split(\$3, d, ":"); print d[2] } }
+  ' /proc/self/mountinfo)
+for m in \$minors; do
+  [ -w "/tmp/fusectl/\$m/abort" ] && echo 1 > "/tmp/fusectl/\$m/abort"
+done
+umount /tmp/fusectl 2>/dev/null
+true
+EOF
+)" >/dev/null 2>&1
   "$runtime" rm -f "$name" >/dev/null 2>&1
 }
 

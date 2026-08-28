@@ -68,21 +68,69 @@ WEDGED_PATHS=()
 # --------------------------------------------------------------------------
 # --remount accounting
 # --------------------------------------------------------------------------
-# Telling these apart is the whole point of the 0.4.1 pass. 0.4.0 had one
-# bucket -- "non-zero, so presumably nothing to do" -- which collapsed
-# "the path is not mounted" together with "I could not find out", and the
-# second case then produced no log line at all. Three oauth2-proxy Pods
-# sat unvirtualized for 75 days behind that silence.
+# Telling these apart is the whole point of the 0.4.1 and 0.4.2 passes.
+# 0.4.0 had one bucket -- "non-zero, so presumably nothing to do" -- which
+# collapsed "the path is not mounted" together with "I could not find
+# out", and the second case then produced no log line at all. Three
+# oauth2-proxy Pods sat unvirtualized for 75 days behind that silence.
 #
-# REMOUNT_FAILED is work this run was supposed to do and did not; it makes
-# --remount exit non-zero. The other two are informational.
-REMOUNT_BOUND=0            # binds this run created
-REMOUNT_ALREADY=0          # already bound, nothing to do
-REMOUNT_ABSENT=0           # source genuinely not present
-REMOUNT_FAILED=()          # hard failures -> non-zero exit
-REMOUNT_DEGRADED=()        # done, but not exactly as intended
-UNREACHABLE_CONTAINERS=()  # container exited mid-scan; normal churn
-UNTOOLED_CONTAINERS=()     # nothing executable reachable inside
+# 0.4.1 split out "could not find out" but still had one bucket, called
+# "source absent", for three unrelated facts:
+#
+#   1. this container was never an LXCFS consumer, so there is nothing to
+#      bind -- normal, and by far the commonest of the three;
+#   2. LXCFS does not serve this file at all -- a property of the node's
+#      daemon, not of any container. Empty on LXCFS 7.0.0, which creates
+#      all eight paths regardless of lxcfs.args, but it is the only way to
+#      tell case 3 apart from a node that simply has fewer files;
+#   3. LXCFS does serve it and this container cannot see it -- a defect.
+#
+# All three printed "'<src>' does not exist, so '<target>' is left as the
+# node's own", eight times per container. On a healthy node with six
+# service-mesh sidecars that is 48 warnings per roll that mean nothing,
+# which is how the one that means something gets missed. They are now
+# counted separately, only (3) warns, and only (3) fails the hook.
+REMOUNT_BOUND=0              # binds this run created
+REMOUNT_ALREADY=0            # already bound, nothing to do
+REMOUNT_NOT_SERVED=0         # (2) lxcfs does not serve this file
+REMOUNT_FAILED=()            # hard failures -> non-zero exit
+REMOUNT_DEGRADED=()          # done, but not exactly as intended
+UNREACHABLE_CONTAINERS=()    # container exited mid-scan; normal churn
+UNTOOLED_CONTAINERS=()       # nothing executable reachable inside
+NON_CONSUMER_CONTAINERS=()   # (1) never had LXCFS mounts to restore
+
+# --------------------------------------------------------------------------
+# Is the canonical mount serving? (--remount precondition)
+# --------------------------------------------------------------------------
+# kubelet runs postStart CONCURRENTLY with the container's ENTRYPOINT and
+# guarantees no ordering between them, so this script can start before
+# entrypoint.sh has cleared the previous daemon's mount, before it has
+# staged anything, and before lxcfs has FUSE-mounted $LXCFS_PATH. Measured
+# on a Docker-in-Docker node driving real rolls: at hook entry the
+# canonical mount was absent from the mount table in 3 out of 3 rolls.
+#
+# 0.4.1's entire answer to that was `sleep 3` -- a timer, not a fact, and
+# one with no failure mode: when it guessed wrong every source file looked
+# absent, every container was skipped, and the hook exited 0. A node could
+# therefore complete a roll with nothing bound and nothing said.
+#
+# So --remount now refuses to iterate containers until $LXCFS_PATH is
+# actually SERVING, and fails loudly when it never does. "Serving" has to
+# mean a cpuview-backed file answers a read: the LXCFS 7.0.0 defect
+# answers lookup and getattr on the mount root instantly and hangs only in
+# read(), so `mountpoint`, `stat` and even `test -d` all report success on
+# a mount that will hang every consumer it is bound into.
+MOUNT_READY_TIMEOUT="${LXCFS_MOUNT_READY_TIMEOUT:-45}"
+READY_PROBE_FILE="${LXCFS_READY_PROBE_FILE:-/proc/cpuinfo}"
+
+# Set when the precondition never held, so discovery is skipped and the
+# run exits non-zero rather than reporting a clean sweep of nothing.
+GATE_FAILED=false
+
+# Targets $LXCFS_PATH does not serve on this node, as a padded string so
+# membership is a substring test and no bash 4 associative array is
+# needed (this file also runs under whatever bash the *node* ships).
+SOURCES_NOT_SERVED=" "
 
 # --------------------------------------------------------------------------
 # Global deadline for --umount
@@ -144,6 +192,12 @@ SKIPPED_BIND_TARGETS=0
 # so degrade to whole seconds where it does not.
 POLL_INTERVAL=0.05
 sleep "$POLL_INTERVAL" 2>/dev/null || POLL_INTERVAL=1
+
+# The precondition gate polls a mount table, which is cheap but not free,
+# and it may do so for tens of seconds; it does not need 50 ms resolution.
+# Derived rather than probed so start-up does not pay a second sleep.
+READY_POLL_INTERVAL=0.5
+[[ "$POLL_INTERVAL" == 1 ]] && READY_POLL_INTERVAL=1
 
 # Run a command with a hard wall-clock bound.
 #   0   command succeeded
@@ -807,14 +861,34 @@ Environment
                         seconds of that budget kept back for tearing down
                         ${LXCFS_PATH}, which the per-container loop may
                         not spend (default: ${HOST_TEARDOWN_RESERVE})
+  LXCFS_MOUNT_READY_TIMEOUT
+                        --remount only: seconds to wait for ${LXCFS_PATH}
+                        to start serving before giving up. The chart
+                        derives this from terminationGracePeriodSeconds
+                        (default: ${MOUNT_READY_TIMEOUT})
+  LXCFS_READY_PROBE_FILE
+                        file under ${LXCFS_PATH} whose read decides
+                        whether the mount is serving. Must be
+                        cpuview-backed to be worth anything
+                        (default: ${READY_PROBE_FILE})
 
---remount exits non-zero if any probe times out, or if it could not do
-work it was supposed to do -- a bind that did not take effect, a container
-whose mount table could not be read, a container with nothing runnable
-inside it -- so a broken node shows up as FailedPostStartHook instead of
-hanging the hook forever or reporting success while doing nothing. A
-container that simply exited mid-scan is reported but does not fail the
-hook.
+--remount will not touch a single container until ${LXCFS_PATH} is
+actually serving -- not merely present in the mount table, but answering a
+read of ${READY_PROBE_FILE}. kubelet fires postStart concurrently with the
+container's ENTRYPOINT and guarantees no ordering, so without that
+precondition the hook can run before lxcfs has mounted, find every source
+absent, skip every container and exit 0.
+
+--remount exits non-zero if that precondition never held, if any probe
+times out, or if it could not do work it was supposed to do -- a bind that
+did not take effect, a container whose mount table could not be read, a
+container with nothing runnable inside it -- so a broken node shows up as
+FailedPostStartHook instead of hanging the hook forever or reporting
+success while doing nothing. A container that simply exited mid-scan is
+reported but does not fail the hook, and neither does a container the
+webhook never injected into: one with no ${LXC_PATH} mount and no LXCFS
+bind in its mount namespace was never an LXCFS consumer, so there is
+nothing to restore in it.
 
 The mount and umount that must run inside a mutated container are executed
 via the statically linked busybox this image stages at
@@ -891,17 +965,238 @@ container_alive() {
   [[ -d "/proc/${1}" ]]
 }
 
+# Block until $LXCFS_PATH is serving, or give up loudly.
+#
+# See the MOUNT_READY_TIMEOUT comment at the top for why this exists. Two
+# distinct waits, deliberately treated differently:
+#
+#   not a mount point yet   The normal start-up race. Polling for it is a
+#                           mount-table parse: it cannot block, cannot
+#                           leak, and costs nothing, so poll to the
+#                           deadline.
+#   mounted, not answering  Not a transient. The read this gate performs
+#                           costs microseconds of CPU, so missing a
+#                           multi-second deadline is not "the node is
+#                           busy", it is the cpuview hang -- and the
+#                           reader that missed it is now parked in
+#                           uninterruptible sleep where no signal can
+#                           reach it. Retrying would park another one per
+#                           attempt, so exactly one is ever spent and the
+#                           wait ends there.
+#
+# Where the wait belongs, and the arithmetic:
+#
+#   Blocking here blocks postStart, which blocks the Pod's kubelet worker
+#   and therefore the Pod going Ready -- which is the correct semantic: a
+#   DaemonSet Pod whose mount does not serve has nothing to offer. It must
+#   not fight the teardown budget, though. The chart derives this timeout
+#   from terminationGracePeriodSeconds exactly as it derives
+#   LXCFS_UMOUNT_BUDGET, so for the default 60s grace period:
+#
+#     terminationGracePeriodSeconds   60
+#     LXCFS_MOUNT_READY_TIMEOUT       45   = max(10, 60 - 15)   [this gate]
+#     LXCFS_UMOUNT_BUDGET             45   = max(5,  60 - 15)   [preStop]
+#       mandatory teardown rungs      13   = probe 5 + abort 3 + lazy 5
+#
+#   The two never run concurrently for one container: they are the start-up
+#   and termination phases of the same instance. The only interleaving is a
+#   DELETE that lands while this gate is still open, in which case kubelet
+#   finishes the hook before it starts killing, so the teardown begins up
+#   to 45s late. That is survivable precisely because this gate only stays
+#   open while the mount is NOT serving, and in that state the teardown is
+#   either "none (not a mount point)" -- a no-op -- or the 13s mandatory
+#   ladder. 45 + 13 = 58 <= 60, so even the worst interleaving fits inside
+#   one grace period.
+lxcfs_wait_until_serving() {
+  local deadline=$((SECONDS + MOUNT_READY_TIMEOUT)) started=$SECONDS
+  local probe="${LXCFS_PATH}${READY_PROBE_FILE}" rc reason="not checked yet"
+
+  while :; do
+    if is_fuse_mounted_in "$(mountinfo_file)" "$LXCFS_PATH"; then
+      run_bounded "$PROBE_TIMEOUT" probe_read "$probe"
+      rc=$?
+      if ((rc == 0)); then
+        echo "INFO: '${LXCFS_PATH}' is serving; '${probe}' answered after" \
+             "$((SECONDS - started))s"
+        return 0
+      fi
+      if ((rc == 124)); then
+        WEDGED_PATHS+=("host mount: ${probe}")
+        reason="'${probe}' did not answer within ${PROBE_TIMEOUT}s; the mount exists but the daemon has stopped answering reads"
+        break
+      fi
+      reason="reading '${probe}' failed with exit ${rc} (a mount whose daemon is gone answers ENOTCONN)"
+    else
+      reason="'${LXCFS_PATH}' is not a FUSE mount in $(mountinfo_file)"
+    fi
+
+    (($(time_left "$deadline") <= 0)) && break
+    sleep "$READY_POLL_INTERVAL"
+  done
+
+  {
+    echo
+    echo "==================================================================="
+    echo "LXCFS is not serving on $(hostname); refusing to remount."
+    echo
+    echo "  waited ${MOUNT_READY_TIMEOUT}s, gave up after $((SECONDS - started))s"
+    echo "  ${reason}"
+    echo
+    echo "Iterating the node's containers from here would find every source"
+    echo "file absent, skip all of them, and exit 0 -- which is how a roll"
+    echo "can complete having restored nothing and said nothing. Failing"
+    echo "instead surfaces as FailedPostStartHook, which is alertable."
+    echo
+    echo "Read this DaemonSet Pod's own log first: entrypoint.sh refuses to"
+    echo "start on a mount it could not clear, and says so."
+    echo
+    echo "See charts/lxcfs-admission-webhook/MIGRATION.md (Recovery)."
+    echo "==================================================================="
+  } >&2
+  return 1
+}
+
+# Which of $LXCFS_TARGETS the canonical mount actually serves on this node.
+#
+# Asked once per run, from the host, after the gate has proved the mount
+# answers. It separates "LXCFS does not offer this file on this node" from
+# "this container cannot see a file LXCFS does offer", which is a defect.
+# 0.4.1 could not tell them apart because it only ever looked at the source
+# through the *container's* view of it, where both look identical.
+#
+# On LXCFS 7.0.0 this comes back empty: all eight paths exist whatever
+# lxcfs.args says -- --enable-loadavg and --enable-cfs change what the
+# files contain, not whether they exist (verified against 7.0.0 run with
+# --foreground alone). So the count is normally 0, and that is the point:
+# it is no longer possible for a genuinely missing file to hide inside a
+# bucket that a healthy node fills with 48 entries. It also keeps working
+# if a future release or flag combination does drop a file.
+#
+# Bounded, because a lookup of /sys/devices/system/cpu/online is itself one
+# of the operations the 7.0.0 defect hangs: LXCFS computes that file's size
+# in getattr, which calls max_cpu_count().
+lxcfs_survey_sources() {
+  local target rc
+
+  for target in "${LXCFS_TARGETS[@]}"; do
+    run_bounded "$PROBE_TIMEOUT" host_view_exists "${LXCFS_PATH}${target}"
+    rc=$?
+    ((rc == 0)) && continue
+
+    SOURCES_NOT_SERVED+="${target} "
+    if ((rc == 124)); then
+      echo "ERROR: '${LXCFS_PATH}${target}' did not answer within ${PROBE_TIMEOUT}s;" \
+           "treating it as not served" >&2
+      WEDGED_PATHS+=("host mount: ${LXCFS_PATH}${target}")
+    fi
+  done
+
+  if [[ "$SOURCES_NOT_SERVED" != " " ]]; then
+    echo "INFO: ${LXCFS_PATH} does not serve:${SOURCES_NOT_SERVED}-- containers keep" \
+         "the node's own file for those paths. LXCFS 7.0.0 creates all of them, so" \
+         "check this daemon's log and lxcfs.args if you did not expect it."
+  fi
+}
+
+source_is_served() {
+  [[ "$SOURCES_NOT_SERVED" != *" ${1} "* ]]
+}
+
+# Was LXCFS ever injected into pid <pid>'s container?
+#   0  yes -- it carries $LXC_PATH, or it already has LXCFS binds
+#   1  no  -- nothing here was ever meant to be bound
+#   2  could not find out
+#
+# Reads /proc/<pid>/mountinfo and nothing else: no exec in the container,
+# no stat of any path, so it works in an image with no executables and
+# cannot block on a wedged FUSE server.
+#
+# Why this question needs asking. The crictl discovery path selects *Pods*
+# carrying the webhook's "mutated" annotation and then walks every
+# container in them, but the webhook only injects into the containers that
+# existed when it saw the Pod. A sidecar injected afterwards by another
+# mutating webhook -- istio-proxy, linkerd-proxy -- is in a mutated Pod and
+# has no LXCFS mounts at all. On the cluster this was found on, six
+# istio-proxy sidecars produced 48 "does not exist" warnings per roll.
+#
+# Two signals, because either alone is wrong:
+#
+#   $LXC_PATH is mounted   The ninth mount in cmd/volume.go. Present in
+#                          every container the webhook injected into, and
+#                          still present after preStop has removed the
+#                          eight binds -- which is the state postStart
+#                          actually runs against.
+#   a target is fuse-mounted
+#                          Covers a Pod mutated by a webhook older than
+#                          that ninth mount: it has the binds but not the
+#                          directory, and it must keep failing loudly
+#                          rather than be dismissed as a non-consumer.
+container_is_consumer() {
+  local file="/proc/${1}/mountinfo"
+
+  [[ -r "$file" ]] || return 2
+
+  awk -v lxc="$LXC_PATH" -v targets="${LXCFS_TARGETS[*]}" '
+    BEGIN { n = split(targets, t, " "); for (i = 1; i <= n; i++) want[t[i]] = 1 }
+    {
+      if ($5 == lxc || index($5, lxc "/") == 1) { found = 1; exit }
+      fstype = ""
+      for (i = 7; i <= NF; i++)
+        if ($i == "-") { fstype = $(i + 1); break }
+      if (fstype ~ /^fuse/ && ($5 in want)) { found = 1; exit }
+    }
+    END { exit !found }
+  ' "$file"
+}
+
+# The shared preamble of lxcfs_remount and lxcfs_umount: is there anything
+# in this container for us to act on at all?
+#   0  yes
+#   1  no, and that is normal -- already counted and reported
+#   2  no, and that is a failure -- already reported
+container_in_scope() {
+  local container_pid=$1 action=$2 crc
+
+  if ! container_alive "$container_pid"; then
+    echo "WARN: pid ${container_pid} no longer exists; nothing to ${action}" >&2
+    UNREACHABLE_CONTAINERS+=("pid ${container_pid}: exited before it could be ${action}ed")
+    return 1
+  fi
+
+  container_is_consumer "$container_pid"
+  crc=$?
+  if ((crc == 2)); then
+    echo "WARN: cannot read '/proc/${container_pid}/mountinfo', so whether it is an" \
+         "LXCFS consumer is unknown; leaving pid ${container_pid} alone" >&2
+    return 2
+  fi
+  if ((crc == 1)); then
+    NON_CONSUMER_CONTAINERS+=("pid ${container_pid}")
+    return 1
+  fi
+  return 0
+}
+
 # remount fuse.lxcfs filesystem in container
 # if fuse.lxcfs mount point is broken in container, umount and mount it again
 # if mount point is ok and fuse.lxcfs filesystem mount in container, mount it again
 lxcfs_remount() {
   local container_pid=$1
 
-  if ! container_alive "$container_pid"; then
-    echo "WARN: pid ${container_pid} no longer exists; nothing to remount" >&2
-    UNREACHABLE_CONTAINERS+=("pid ${container_pid}: exited before it could be remounted")
-    return 0
-  fi
+  # Asked before anything is exec'd, which is not merely tidier: a sidecar
+  # that is both distroless and not a consumer -- no $LXC_PATH mount, so no
+  # staged busybox reachable, and no mount/umount of its own -- used to
+  # reach resolve_container_tools, fail it, land in REMOUNT_FAILED and take
+  # the whole node's postStart hook down with it. One container the webhook
+  # never touched could put the DaemonSet into CrashLoopBackOff.
+  container_in_scope "$container_pid" remount
+  case $? in
+  1) return 0 ;;
+  2)
+    REMOUNT_FAILED+=("pid ${container_pid}: could not read the container's mount table")
+    return 1
+    ;;
+  esac
 
   if ! resolve_container_tools "$container_pid"; then
     {
@@ -953,6 +1248,18 @@ lxcfs_remount() {
       esac
     fi
 
+    # LXCFS does not offer this file on this node, so leaving the
+    # container on the node's own is the correct outcome, not a problem.
+    # Established once per run against the canonical mount by
+    # lxcfs_survey_sources, which also named the files -- so nothing is
+    # printed here. This branch is the reason a healthy node no longer
+    # emits eight warnings per container about paths that were never
+    # going to exist.
+    if ! source_is_served "$target"; then
+      REMOUNT_NOT_SERVED=$((REMOUNT_NOT_SERVED + 1))
+      continue
+    fi
+
     # Bind the canonical LXCFS file over the container's, but only once
     # we have confirmed the canonical file actually answers. Probing the
     # source first is the whole point: a mount that merely *exists* proves
@@ -965,14 +1272,21 @@ lxcfs_remount() {
       continue
     fi
     if ((rc != 0)); then
-      # Not a hard failure: LXCFS may not have created this file (an
-      # --enable-* flag it was not given), in which case leaving the
-      # container on the host's file is correct. Say so, because 0.4.0
-      # reached this branch for *every* path in a distroless container and
-      # printed nothing.
-      REMOUNT_ABSENT=$((REMOUNT_ABSENT + 1))
-      echo "WARN: pid ${container_pid}: '${source}' does not exist, so" \
-           "'${target}' is left as the node's own" >&2
+      # A hard failure now, unlike in 0.4.1. The node serves this file --
+      # lxcfs_survey_sources just read it -- and this container is a
+      # consumer, so the file not being visible inside it means the path
+      # that carries it is broken: either the Pod lacks the ${LXC_PATH}/
+      # mount (mutated by a webhook older than cmd/volume.go's ninth
+      # mount), or that mount is not propagating, which needs ${LXC_PATH}
+      # to be a shared mount on the node for HostToContainer to work.
+      # Either way the container will never see virtualized values and
+      # nothing here can fix it, so say so and fail the hook.
+      echo "ERROR: pid ${container_pid}: '${source}' is served by ${LXCFS_PATH} on this" \
+           "node but is not visible inside the container, so '${target}' cannot be" \
+           "bound. The Pod is missing the ${LXC_PATH}/ mount, or that mount is not" \
+           "receiving the node's mounts (HostToContainer needs ${LXC_PATH} to be a" \
+           "shared mount on the node)." >&2
+      REMOUNT_FAILED+=("pid ${container_pid}: ${target}: '${source}' is served on the node but not visible in the container")
       continue
     fi
 
@@ -1005,10 +1319,14 @@ lxcfs_remount() {
 lxcfs_umount() {
   local container_pid=$1
 
-  if ! container_alive "$container_pid"; then
-    echo "WARN: pid ${container_pid} no longer exists; nothing to unmount" >&2
-    return 0
-  fi
+  # Same question as in lxcfs_remount, and it matters here too: without it
+  # a distroless sidecar the webhook never touched produced "leaving its
+  # LXCFS bind mounts in place" on every teardown -- a warning about bind
+  # mounts it never had.
+  container_in_scope "$container_pid" unmount
+  case $? in
+  1 | 2) return 0 ;;
+  esac
 
   # A container with nothing runnable inside keeps its binds. That is
   # recoverable -- they answer ENOTCONN once the connection is aborted and
@@ -1182,9 +1500,21 @@ main() {
       DEADLINE=$((SECONDS + 86400))
       BIND_DEADLINE=$DEADLINE
 
-      # wait 3 seconds to start lxcfs
-      # for post-start hook is executed immediately after a container is created
-      sleep 3
+      # Replaces 0.4.1's `sleep 3`, whose comment ("wait 3 seconds to start
+      # lxcfs, for post-start hook is executed immediately after a
+      # container is created") named the race correctly and then answered
+      # it with a timer. See lxcfs_wait_until_serving.
+      #
+      # The chart's postStart hook already gates in-container before it
+      # ever gets here, so on a healthy roll this returns on its first
+      # poll. It stays because a manual run, an older chart's hook command
+      # and any future caller must get the same guarantee instead of
+      # quietly skipping every container on the node.
+      if lxcfs_wait_until_serving; then
+        lxcfs_survey_sources
+      else
+        GATE_FAILED=true
+      fi
       ;;
     *)
       usage
@@ -1194,10 +1524,15 @@ main() {
     usage
   fi
 
-  if command -v docker >/dev/null; then
-    docker_cli
-  else
-    crictl_cli
+  # Skipped entirely when the precondition failed. Walking the node's
+  # containers against a mount that does not serve is the behaviour this
+  # release removes, not a fallback.
+  if [[ "$GATE_FAILED" == false ]]; then
+    if command -v docker >/dev/null; then
+      docker_cli
+    else
+      crictl_cli
+    fi
   fi
 
   # Detach the canonical mount only after the in-container binds are
@@ -1221,6 +1556,10 @@ main() {
              "because nothing executable was reachable inside them:" \
              "${UNTOOLED_CONTAINERS[*]}"
       fi
+      if ((${#NON_CONSUMER_CONTAINERS[@]} > 0)); then
+        echo "INFO: ${#NON_CONSUMER_CONTAINERS[@]} container(s) had no LXCFS mounts to" \
+             "remove (not consumers): ${NON_CONSUMER_CONTAINERS[*]}"
+      fi
     } >&2
   fi
 
@@ -1230,11 +1569,25 @@ main() {
   # thing that made the distroless bug survive 75 days was a hook log that
   # said nothing at all. A one-line tally makes "did no work" visibly
   # different from "had no work to do".
-  if [[ "$REMOUNT" == true ]]; then
+  if [[ "$REMOUNT" == true ]] && [[ "$GATE_FAILED" == true ]]; then
+    echo "INFO: remount did nothing after $((SECONDS - started_at))s:" \
+         "${LXCFS_PATH} never started serving, so no container was touched." \
+         "Nothing was unbound either -- a container that still has the last" \
+         "daemon's bind keeps it, and it reads ENOTCONN rather than hanging." >&2
+  elif [[ "$REMOUNT" == true ]]; then
     {
       echo "INFO: remount finished in $((SECONDS - started_at))s:" \
            "${REMOUNT_BOUND} bound, ${REMOUNT_ALREADY} already mounted," \
-           "${REMOUNT_ABSENT} source(s) absent, ${#REMOUNT_FAILED[@]} failed"
+           "${REMOUNT_NOT_SERVED} not served by lxcfs," \
+           "${#NON_CONSUMER_CONTAINERS[@]} container(s) not LXCFS consumers," \
+           "${#REMOUNT_FAILED[@]} failed"
+      if ((${#NON_CONSUMER_CONTAINERS[@]} > 0)); then
+        echo "INFO: nothing to restore in ${#NON_CONSUMER_CONTAINERS[@]} container(s):" \
+             "no ${LXC_PATH} mount and no LXCFS bind in their mount namespace, so the" \
+             "webhook never injected into them. Sidecars added to a mutated Pod after" \
+             "the fact (istio-proxy, linkerd-proxy) are the normal reason." \
+             "${NON_CONSUMER_CONTAINERS[*]}"
+      fi
       if ((${#UNREACHABLE_CONTAINERS[@]} > 0)); then
         echo "INFO: skipped ${#UNREACHABLE_CONTAINERS[@]} container(s) that exited" \
              "mid-scan: ${UNREACHABLE_CONTAINERS[*]}"
@@ -1313,6 +1666,14 @@ main() {
     if [[ "$REMOUNT" == true ]]; then
       exit 1
     fi
+  fi
+
+  # A precondition that never held is a failure even when nothing was
+  # wedged -- the commonest shape is a daemon that never mounted at all,
+  # which produces no wedged path to report. Reported here rather than by
+  # returning early from the gate so the blocks above still print.
+  if [[ "$GATE_FAILED" == true ]]; then
+    exit 1
   fi
 
   # Same reasoning for work that could not be completed for any other

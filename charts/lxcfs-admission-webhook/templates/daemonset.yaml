@@ -6,10 +6,25 @@ metadata:
   labels:
     {{- include "lxcfs-admission-webhook.labels" . | nindent 4 }}
     app: {{ include "lxcfs-admission-webhook.lxcfsFullname" . }}
+{{- $grace := int .Values.lxcfs.terminationGracePeriodSeconds }}
+{{- /*
+  postStart gate budget. Derived from the grace period exactly as
+  LXCFS_UMOUNT_BUDGET is, so the two cannot drift apart. Worst-case
+  interleaving is gate + the teardown's mandatory rungs (probe 5 + abort 3
+  + lazy detach 5 = 13s), which for the default 60s grace period is
+  45 + 13 = 58 <= 60. See MIGRATION.md.
+*/}}
+{{- $gate := max 10 (sub $grace 15) }}
 spec:
   selector:
     matchLabels:
       app: {{ include "lxcfs-admission-webhook.lxcfsFullname" . }}
+  # Stated explicitly rather than left to the API default, because the
+  # readinessProbe below is only a brake on a bad rollout if maxUnavailable
+  # keeps the controller from replacing the next node's Pod while this one
+  # is not Ready.
+  updateStrategy:
+    {{- toYaml .Values.lxcfs.updateStrategy | nindent 4 }}
   template:
     metadata:
       labels:
@@ -58,20 +73,82 @@ spec:
             # nsenter passes its environment through, so this reaches the
             # script even though the hook re-executes it on the host.
             - name: LXCFS_UMOUNT_BUDGET
-              value: {{ max 5 (sub (int .Values.lxcfs.terminationGracePeriodSeconds) 15) | quote }}
+              value: {{ max 5 (sub $grace 15) | quote }}
+            # How long the postStart gate waits for the FUSE mount to
+            # start answering reads. Derived from the same grace period;
+            # see the arithmetic at the top of this file.
+            - name: LXCFS_MOUNT_READY_TIMEOUT
+              value: {{ $gate | quote }}
+            # Seconds allowed for one read through the mount. Kept below
+            # the probe's own timeoutSeconds so the script always returns
+            # its own verdict, with the reason, instead of being SIGKILLed
+            # and reported as an opaque probe timeout. (The parked-reader
+            # record is written before the read, so a kill cannot leak a
+            # second reader either way -- this is about the diagnosis.)
+            - name: LXCFS_READY_READ_TIMEOUT
+              value: {{ max 1 (sub (int .Values.lxcfs.readinessProbe.timeoutSeconds) 2) | quote }}
           lifecycle:
             postStart:
               exec:
                 command:
                   - /bin/bash
                   - -c
-                  - nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --remount
+                  # Two stages, and the order is the fix.
+                  #
+                  # kubelet starts this hook concurrently with the
+                  # container's ENTRYPOINT and guarantees no ordering, so
+                  # at this instant lxcfs has usually not mounted yet
+                  # (measured: absent from the mount table in 3 of 3
+                  # rolls) and /var/lib/lxc/script/lxcfs-mount.sh is still
+                  # the copy staged by the release being REPLACED -- the
+                  # entrypoint is busy overwriting it. Running the staged
+                  # script first therefore ran the outgoing release's
+                  # code, so a fix never took effect on the roll that
+                  # deployed it.
+                  #
+                  # Stage one runs from the image, where it cannot be
+                  # stale, and returns only once the mount answers a read
+                  # of a cpuview-backed file and the staged files match
+                  # this image's. Stage two is then guaranteed to be the
+                  # current script running against a serving mount. If
+                  # stage one gives up, the && short-circuits and the hook
+                  # fails, which surfaces as FailedPostStartHook.
+                  - /lxcfs/lxcfs-ready.sh --wait && nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --remount
             preStop:
               exec:
                 command:
                   - /bin/bash
                   - -c
                   - nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --umount
+          {{- if .Values.lxcfs.readinessProbe.enabled }}
+          # "Ready" used to mean "the process exec'd". During the 7.0.0
+          # incident a Pod reported 1/1 Running on a node where every read
+          # through its mount hung forever, and the rolling update moved on
+          # to the second node and wrecked that one too. This makes Ready
+          # mean "a cpuview-backed file answers a read", which is the only
+          # claim worth making.
+          #
+          # It has to be a cpuview-backed file: the defect answers lookup
+          # and getattr on the mount root instantly and hangs only in
+          # read(), so mountpoint/stat/test -d all pass on a wedged mount,
+          # and so does reading /proc/meminfo.
+          #
+          # The probe cannot hang and cannot leak: lxcfs-ready.sh
+          # backgrounds its read and polls (never timeout(1), which would
+          # block in wait() on a task in uninterruptible sleep), and it
+          # records the one reader it had to leave parked so no later
+          # period starts another. At most one parked task per container
+          # instance, no matter how long the mount stays wedged.
+          readinessProbe:
+            exec:
+              command:
+                - /lxcfs/lxcfs-ready.sh
+            initialDelaySeconds: {{ .Values.lxcfs.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.lxcfs.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.lxcfs.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.lxcfs.readinessProbe.failureThreshold }}
+            successThreshold: 1
+          {{- end }}
           resources:
             {{- toYaml .Values.lxcfs.resources | nindent 12 }}
           volumeMounts:

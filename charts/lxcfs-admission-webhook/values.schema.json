@@ -91,7 +91,27 @@
         "terminationGracePeriodSeconds": {
           "type": "integer",
           "minimum": 20,
-          "description": "Grace period for the LXCFS DaemonSet Pod. The preStop teardown budget is derived from it as max(5, value - 15)s; below 20 the FUSE teardown cannot fit its mandatory probe/abort/lazy-detach rungs"
+          "description": "Grace period for the LXCFS DaemonSet Pod. The preStop teardown budget is derived from it as max(5, value - 15)s and the postStart mount-ready gate as max(10, value - 15)s; below 20 the FUSE teardown cannot fit its mandatory probe/abort/lazy-detach rungs"
+        },
+        "readinessProbe": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Readiness for the LXCFS DaemonSet Pod: reads a cpuview-backed file through the mount, so Ready means the mount serves",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "timeoutSeconds": {
+              "type": "integer",
+              "minimum": 3,
+              "description": "kubelet's exec timeout. The script's own read deadline is max(1, this - 2)s so it can always report before being killed; below 3 that leaves no usable read window"
+            },
+            "failureThreshold": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "updateStrategy": {
+          "type": "object",
+          "description": "DaemonSet updateStrategy. maxUnavailable is what turns a failing readinessProbe into a stopped rollout"
         },
         "podAnnotations": { "type": "object" },
         "tolerations": {

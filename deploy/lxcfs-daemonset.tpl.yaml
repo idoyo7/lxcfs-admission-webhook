@@ -16,6 +16,12 @@ spec:
         mutating.lxcfs-admission-webhook.io/enable: 'false'
     spec:
       hostPID: true
+      # The preStop teardown shares this window with SIGTERM and the
+      # container's exit. LXCFS_UMOUNT_BUDGET below must fit inside it; see
+      # charts/lxcfs-admission-webhook/MIGRATION.md for the arithmetic.
+      # This raw-manifest path is a plain port of the chart's DaemonSet and
+      # is not kept in step with every chart value -- prefer the chart.
+      terminationGracePeriodSeconds: 60
       tolerations:
         - key: node-role.kubernetes.io/master
           effect: NoSchedule
@@ -34,19 +40,41 @@ spec:
           imagePullPolicy: Always
           securityContext:
             privileged: true
+          env:
+            - name: LXCFS_UMOUNT_BUDGET
+              value: "45"
+            - name: LXCFS_MOUNT_READY_TIMEOUT
+              value: "45"
+            - name: LXCFS_READY_READ_TIMEOUT
+              value: "3"
           lifecycle:
             postStart:
               exec:
                 command:
                   - /bin/bash
                   - -c
-                  - nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --remount
+                  # Stage one runs from the image and returns only once the
+                  # FUSE mount answers a read and this image's files are
+                  # staged on the node. kubelet fires this hook
+                  # concurrently with the ENTRYPOINT, so without it stage
+                  # two can run before the mount exists, and can execute
+                  # the previous release's copy of the staged script.
+                  - /lxcfs/lxcfs-ready.sh --wait && nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --remount
             preStop:
               exec:
                 command:
                   - /bin/bash
                   - -c
                   - nsenter -t 1 -m -- /var/lib/lxc/script/lxcfs-mount.sh --umount
+          # Ready means the mount serves, not that the daemon started.
+          readinessProbe:
+            exec:
+              command:
+                - /lxcfs/lxcfs-ready.sh
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             limits:
               cpu: "500m"

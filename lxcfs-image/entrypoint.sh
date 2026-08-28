@@ -225,8 +225,82 @@ fi
 [[ ! -d "$LXCFS_PATH" ]] && mkdir -p "$LXCFS_PATH"
 [[ ! -d "$LXCFS_SCRIPT_PATH" ]] && mkdir -p "$LXCFS_SCRIPT_PATH"
 
-cat /lxcfs/lxcfs-mount.sh > "${LXCFS_SCRIPT_PATH}/lxcfs-mount.sh"
-chmod +x "${LXCFS_SCRIPT_PATH}/lxcfs-mount.sh"
+# Copy $1 to $2 atomically, skipping an identical file.
+#
+# Atomic is not a nicety here, it is the fix for a defect this release
+# exists to remove. kubelet fires the postStart hook CONCURRENTLY with this
+# entrypoint and guarantees no ordering between them, and that hook exec's
+# ${LXCFS_SCRIPT_PATH}/lxcfs-mount.sh -- a file that survives on the node's
+# hostPath from the release being replaced, and that this entrypoint
+# used to rewrite in place with `cat src > dst`, i.e. with O_TRUNC.
+#
+# Two things went wrong with that, both reproduced on a Docker-in-Docker
+# node driving real container lifecycles:
+#
+#   1. The hook exec'd the OUTGOING release's script (measured: the staged
+#      script was stale at hook entry in 3 out of 3 rolls), so the fix in a
+#      new image did not take effect on the roll that deployed it. Mutated
+#      Alpine containers ended those rolls reading the node's /proc.
+#   2. Worse, bash does not read a script in one gulp; it reads, executes,
+#      and comes back for more at a saved offset. Truncating and rewriting
+#      the file underneath a running bash therefore SPLICES the two
+#      versions: observed symptoms were `tool: busybox ()` -- the new
+#      resolve_container_tools() running against the old file's variable
+#      block, so $CONTAINER_BUSYBOX was unset -- and a tally line printed
+#      with empty counters.
+#
+# rename(2) fixes both halves: a reader either has the old inode, which is
+# never modified and stays complete, or the new one. It is also why the
+# busybox staging below already worked this way -- truncating a binary
+# another container is executing gets ETXTBSY -- so this is that treatment
+# extended to the file that actually gets executed on every roll.
+#
+# $LXCFS_SCRIPT_PATH is under $LXC_PATH, which the webhook bind-mounts into
+# every Pod it mutates (cmd/volume.go, ninth mount: /var/lib/lxc/,
+# HostToContainer, read-only), so anything dropped here is reachable at the
+# same absolute path inside every container lxcfs-mount.sh touches.
+stage_file() {
+  local src=$1 dst=$2 what=$3
+  local tmp="${dst}.staging.$$"
+
+  # Skip an identical file so a DaemonSet roll does not churn a file that
+  # another process may be reading or executing right now.
+  if cmp -s "$src" "$dst" 2>/dev/null; then
+    echo "INFO: ${dst} is already current"
+    return 0
+  fi
+
+  if cat "$src" >"$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$dst"; then
+    echo "INFO: staged ${what} ($(stat -c %s "$dst" 2>/dev/null || echo '?') bytes) at ${dst}"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  echo "ERROR: could not stage ${src} at ${dst}" >&2
+  return 1
+}
+
+# Remove temp files from a previous run that was killed between the write
+# and the rename. Only this Pod writes here -- one DaemonSet Pod per node --
+# so there is nobody else's in-flight staging to destroy.
+rm -f "${LXCFS_SCRIPT_PATH}"/.busybox.* "${LXCFS_SCRIPT_PATH}"/*.staging.* 2>/dev/null || true
+
+stage_script() {
+  local src=/lxcfs/lxcfs-mount.sh
+
+  if [[ ! -r "$src" ]]; then
+    echo "ERROR: ${src} is missing from this image. The lifecycle hooks have" >&2
+    echo "       nothing to run. This is a broken image build." >&2
+    return 1
+  fi
+
+  stage_file "$src" "${LXCFS_SCRIPT_PATH}/lxcfs-mount.sh" "lxcfs-mount.sh"
+}
+
+# Refuse to start without it, for the same reason as the busybox below: a
+# daemon whose preStop tears bind mounts down while its postStart cannot
+# put them back is the silent outage this line prevents.
+stage_script
 
 # Stage the statically linked busybox next to the script.
 #
@@ -247,14 +321,11 @@ chmod +x "${LXCFS_SCRIPT_PATH}/lxcfs-mount.sh"
 # either. Executing from a read-only mount is fine; only noexec would
 # stop it, and a hostPath mount does not carry it.
 #
-# Renamed into place rather than written over: a container may be
-# executing this exact file right now, and truncating a running binary
-# gets ETXTBSY. rename(2) leaves the old inode alone for anyone still
-# using it.
+# Renamed into place rather than written over, via stage_file above: a
+# container may be executing this exact file right now, and truncating a
+# running binary gets ETXTBSY.
 stage_busybox() {
   local src=/bin/busybox
-  local dst="${LXCFS_SCRIPT_PATH}/busybox"
-  local tmp="${LXCFS_SCRIPT_PATH}/.busybox.$$"
 
   if [[ ! -x "$src" ]]; then
     echo "ERROR: ${src} is missing from this image. lxcfs-mount.sh cannot" >&2
@@ -263,21 +334,7 @@ stage_busybox() {
     return 1
   fi
 
-  # Skip an identical file so a DaemonSet roll does not churn a binary
-  # that other containers may be executing.
-  if cmp -s "$src" "$dst" 2>/dev/null; then
-    echo "INFO: ${dst} is already current"
-    return 0
-  fi
-
-  if cat "$src" > "$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$dst"; then
-    echo "INFO: staged $(stat -c %s "$dst" 2>/dev/null || echo '?') byte static busybox at ${dst}"
-    return 0
-  fi
-
-  rm -f "$tmp"
-  echo "ERROR: could not stage ${src} at ${dst}" >&2
-  return 1
+  stage_file "$src" "${LXCFS_SCRIPT_PATH}/busybox" "static busybox"
 }
 
 # Refuse to start without it. A daemon that comes up while the node has no
