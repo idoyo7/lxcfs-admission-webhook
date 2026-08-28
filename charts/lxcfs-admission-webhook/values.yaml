@@ -48,13 +48,46 @@ lxcfs:
   image:
     repository: ghcr.io/idoyo7/lxcfs
     # renovate: datasource=github-releases depName=lxc/lxcfs extractVersion=^v(?<version>.*)$
-    tag: 7.0.0-2
+    tag: 7.0.0-3
     pullPolicy: Always
   resources:
     limits:
       cpu: 500m
       memory: 128Mi
     requests: {}
+  # -- Readiness for the LXCFS DaemonSet Pod. The probe reads a
+  # cpuview-backed file *through* the mount, so "Ready" means the mount
+  # serves rather than "the daemon started" — during the 7.0.0 incident a
+  # Pod reported `1/1 Running` on a node where every such read hung
+  # forever, and the roll proceeded to the next node. Combined with
+  # `updateStrategy.rollingUpdate.maxUnavailable`, a failing probe stops
+  # the roll instead of spreading it.
+  #
+  # The defaults are deliberately slack against a slow node: a healthy read
+  # costs microseconds of CPU, so `timeoutSeconds: 5` is ~4 orders of
+  # magnitude of headroom, and `failureThreshold: 3` needs three
+  # consecutive failures — a wedged mount is reported NotReady after
+  # roughly `initialDelay + failureThreshold × period` = 35s. Measured
+  # healthy start-up on an idle node is ~0.2s from container start to the
+  # mount answering.
+  #
+  # `timeoutSeconds` is also the ceiling for the script's own read
+  # deadline, which the chart sets to `max(1, this - 2)` so the script
+  # always returns before kubelet kills it.
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  # -- Rolling update policy for the DaemonSet. Spelled out rather than
+  # left to the API default because it is what makes the readinessProbe a
+  # brake: with `maxUnavailable: 1` the controller will not replace the
+  # next node's Pod until this one is Ready.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   # -- Host path used to expose LXCFS state to other Pods on the node
   hostPath: /var/lib/lxc
   # -- Termination grace period for the DaemonSet Pod. The preStop hook
@@ -65,6 +98,13 @@ lxcfs:
   # passed in as `LXCFS_UMOUNT_BUDGET`, so the two cannot drift. 30 (the
   # Kubernetes default, and what this chart used before 0.4.0) is not
   # enough on a node with many mutated Pods -- see MIGRATION.md.
+  #
+  # The postStart gate added in 0.4.2 is derived from the same value as
+  # `max(10, this - 15)` and passed in as `LXCFS_MOUNT_READY_TIMEOUT`.
+  # Start-up and termination are different phases and never overlap for
+  # one container, except when a delete lands while the gate is still
+  # open; `45 + 13` (the teardown's mandatory rungs) `= 58 <= 60` keeps
+  # even that inside one grace period. Arithmetic in MIGRATION.md.
   terminationGracePeriodSeconds: 60
   podAnnotations:
     mutating.lxcfs-admission-webhook.io/enable: "false"

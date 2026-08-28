@@ -156,7 +156,7 @@ ENV LXCFS_VERSION=${LXCFS_VERSION}
 # lxcfs-mount.sh and verify-lxcfs.sh shell out to every one of these, and
 # a silently missing binary here would only show up as a broken hook on a
 # node. Fail the build instead.
-RUN chmod +x /lxcfs/entrypoint.sh /lxcfs/verify-lxcfs.sh && \
+RUN chmod +x /lxcfs/entrypoint.sh /lxcfs/verify-lxcfs.sh /lxcfs/lxcfs-ready.sh && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         dumb-init \
