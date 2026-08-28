@@ -87,7 +87,7 @@ documentation comments. Key parameters are summarised below.
 | `webhook.port` | `8443` | HTTPS port the webhook listens on |
 | `webhook.resources` | see values.yaml | CPU/memory limits for the webhook |
 | `lxcfs.image.repository` | `ghcr.io/idoyo7/lxcfs` | LXCFS image repository |
-| `lxcfs.image.tag` | `7.0.0-1` | LXCFS image tag |
+| `lxcfs.image.tag` | `7.0.0-2` | LXCFS image tag |
 | `lxcfs.hostPath` | `/var/lib/lxc` | Node path where LXCFS state is exposed |
 | `lxcfs.terminationGracePeriodSeconds` | `60` | Window the preStop FUSE teardown must fit inside; the script's budget is derived from it as `max(5, value - 15)`s |
 | `lxcfs.tolerations` | tolerates master/control-plane | DaemonSet tolerations |
@@ -117,7 +117,14 @@ LXCFS DaemonSet (every linux node)
   **not safe to deploy** — its LXCFS image hangs every reader of
   `/proc/cpuinfo`, `/proc/stat` and `/sys/devices/system/cpu/online`
   ([lxc/lxcfs#730](https://github.com/lxc/lxcfs/issues/730)). Go from
-  `0.2.x` straight to `0.4.0`.
+  `0.2.x` straight to `0.4.1`.
+- Chart `0.4.1` fixes a silent correctness gap in `0.4.0`: the postStart
+  hook could not restore LXCFS bind mounts in a container whose image
+  ships no `mount`/`umount` — distroless (oauth2-proxy, istio-proxy) and
+  Alpine-based alike — and reported success anyway. Such a container lost
+  its virtualized `/proc` at the first DaemonSet roll after it started and
+  never got it back. Pods created before the fix keep working until that
+  roll.
 - MIGRATION.md also covers the cgroup v2 requirement, a pre-flight check
   that actually exercises the affected files, and the recovery procedure
   for a node with a wedged or leaked LXCFS mount.

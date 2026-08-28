@@ -228,6 +228,64 @@ fi
 cat /lxcfs/lxcfs-mount.sh > "${LXCFS_SCRIPT_PATH}/lxcfs-mount.sh"
 chmod +x "${LXCFS_SCRIPT_PATH}/lxcfs-mount.sh"
 
+# Stage the statically linked busybox next to the script.
+#
+# lxcfs-mount.sh has to run mount(2) and umount2(2) *inside* each mutated
+# container, because both act on the calling process's mount namespace.
+# `nsenter -t <pid> -m -- mount` enters that namespace and then resolves
+# the binary there, so it fails outright in a distroless image, which
+# ships no mount, no umount, no test and no shell. Before 0.4.1 that
+# failure was read as "there is nothing to do" and the container was
+# skipped without a log line.
+#
+# $LXCFS_SCRIPT_PATH is under $LXC_PATH, which the webhook bind-mounts
+# into every Pod it mutates (cmd/volume.go, ninth mount: /var/lib/lxc/,
+# HostToContainer, read-only). A binary dropped here is therefore
+# reachable at the same absolute path inside every container this script
+# touches, needs no cooperation from the workload's image, and -- being
+# static -- needs no dynamic loader, which those images do not have
+# either. Executing from a read-only mount is fine; only noexec would
+# stop it, and a hostPath mount does not carry it.
+#
+# Renamed into place rather than written over: a container may be
+# executing this exact file right now, and truncating a running binary
+# gets ETXTBSY. rename(2) leaves the old inode alone for anyone still
+# using it.
+stage_busybox() {
+  local src=/bin/busybox
+  local dst="${LXCFS_SCRIPT_PATH}/busybox"
+  local tmp="${LXCFS_SCRIPT_PATH}/.busybox.$$"
+
+  if [[ ! -x "$src" ]]; then
+    echo "ERROR: ${src} is missing from this image. lxcfs-mount.sh cannot" >&2
+    echo "       restore bind mounts in containers that ship no mount/umount" >&2
+    echo "       of their own. This is a broken image build." >&2
+    return 1
+  fi
+
+  # Skip an identical file so a DaemonSet roll does not churn a binary
+  # that other containers may be executing.
+  if cmp -s "$src" "$dst" 2>/dev/null; then
+    echo "INFO: ${dst} is already current"
+    return 0
+  fi
+
+  if cat "$src" > "$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$dst"; then
+    echo "INFO: staged $(stat -c %s "$dst" 2>/dev/null || echo '?') byte static busybox at ${dst}"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  echo "ERROR: could not stage ${src} at ${dst}" >&2
+  return 1
+}
+
+# Refuse to start without it. A daemon that comes up while the node has no
+# staged busybox will tear down bind mounts in preStop that its own
+# postStart then cannot restore -- which is exactly the 75-day silent
+# outage this release fixes. Crash-looping is alertable; that is not.
+stage_busybox
+
 # Run lxcfs with whatever args were passed (CMD or container.args). Falls
 # back to the historical default when invoked with no args, so the image
 # still works when run standalone.
