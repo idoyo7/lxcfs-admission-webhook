@@ -87,7 +87,7 @@ documentation comments. Key parameters are summarised below.
 | `webhook.port` | `8443` | HTTPS port the webhook listens on |
 | `webhook.resources` | see values.yaml | CPU/memory limits for the webhook |
 | `lxcfs.image.repository` | `ghcr.io/idoyo7/lxcfs` | LXCFS image repository |
-| `lxcfs.image.tag` | `7.0.0-3` | LXCFS image tag |
+| `lxcfs.image.tag` | `7.0.0-4` | LXCFS image tag |
 | `lxcfs.hostPath` | `/var/lib/lxc` | Node path where LXCFS state is exposed |
 | `lxcfs.terminationGracePeriodSeconds` | `60` | Window the preStop FUSE teardown must fit inside; the script's budget is derived from it as `max(5, value - 15)`s, and the postStart mount-ready gate as `max(10, value - 15)`s |
 | `lxcfs.readinessProbe.enabled` | `true` | Gate `Ready` on a read of a cpuview-backed file *through* the mount, rather than on the daemon having started |

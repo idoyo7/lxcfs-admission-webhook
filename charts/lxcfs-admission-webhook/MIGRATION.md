@@ -1,5 +1,36 @@
 # Migration guide
 
+## 0.4.2 -> 0.4.3 (base images and toolchain refresh)
+
+No values, template or script change. `lxcfs.image.tag` moves from
+`7.0.0-3` to `7.0.0-4` (both stages rebased from `debian:bookworm-slim`
+onto `debian:trixie-slim`; libfuse 3.14 -> 3.17, runtime package
+`libfuse3-3` -> `libfuse3-4`; `patches/0001` still applies because
+lxc/lxcfs#730 is open) and `appVersion` moves from `0.1.0` to `0.1.1`
+(webhook rebuilt with Go 1.27 on `alpine:3.24`, `k8s.io/*` 0.37).
+
+Release order matters: push the `v0.1.1` git tag and let `Publish images`
+finish **before** anything installs chart `0.4.3`, or the webhook
+Deployment's new ReplicaSet sits in `ImagePullBackOff` (the old Pods keep
+serving, so it fails quietly).
+
+### Upgrade steps
+
+1. `./lxcfs-image/verify-lxcfs.sh image ghcr.io/idoyo7/lxcfs:7.0.0-4`
+   on an amd64 host. This proves the image, not the roll.
+2. Bump the chart and let the DaemonSet roll with **no manual step in
+   between**. Everything this chart has ever broken passed the lab checks
+   and failed only on a real DaemonSet roll.
+3. Right after the roll, without restarting or exec-ing anything first,
+   read `/proc/meminfo` in an existing mutated Pod that has a memory limit:
+   ```sh
+   kubectl exec <pod> -- head -1 /proc/meminfo
+   ```
+   `MemTotal` must equal the Pod's limit (e.g. `131072 kB` for `128Mi`).
+   The node's own value (for example `65600692 kB`) means the roll failed.
+4. Repeat step 3 on every node, and once for a distroless or Alpine
+   workload via `/var/lib/lxc/script/busybox head -1 /proc/meminfo`.
+
 ## 0.4.1 -> 0.4.2 (the postStart hook stops racing its own entrypoint)
 
 Image-and-chart, no webhook change: `lxcfs.image.tag` moves from `7.0.0-2`
