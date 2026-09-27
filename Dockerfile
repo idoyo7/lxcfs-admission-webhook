@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine3.21 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.24 AS build
 ARG TARGETOS TARGETARCH
 
 WORKDIR /src
@@ -12,7 +12,7 @@ ADD . .
 RUN apk add --no-cache make git && \
     GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 make build
 
-FROM alpine:3.21
+FROM alpine:3.24
 
 LABEL maintainer="idoyo7 <idoyo7@gmail.com>"
 LABEL org.opencontainers.image.source="https://github.com/idoyo7/lxcfs-admission-webhook"

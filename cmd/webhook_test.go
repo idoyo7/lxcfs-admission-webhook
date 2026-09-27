@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/golang/glog"
-	"gotest.tools/assert"
+	"gotest.tools/v3/assert"
 	"io"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
