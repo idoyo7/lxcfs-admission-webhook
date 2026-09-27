@@ -27,11 +27,13 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: azure/setup-helm@v4
+      # Match the renderer that actually installs this chart: Argo CD
+      # v3.5.x bundles Helm 4.2.1, so lint/template with the same major.
+      - uses: azure/setup-helm@v5
         with:
-          version: v3.16.4
+          version: v4.2.1
 
       - name: helm lint
         run: helm lint ${{ env.CHART_PATH }}
@@ -43,7 +45,7 @@ jobs:
 
       - name: kubeconform validate
         run: |
-          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz \
             | tar -xz -C /tmp kubeconform
           /tmp/kubeconform -strict -ignore-missing-schemas \
             -schema-location default \
@@ -60,20 +62,22 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: azure/setup-helm@v4
+      # Match the renderer that actually installs this chart: Argo CD
+      # v3.5.x bundles Helm 4.2.1, so lint/template with the same major.
+      - uses: azure/setup-helm@v5
         with:
-          version: v3.16.4
+          version: v4.2.1
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4.1.2
 
       # Both helm push and `cosign sign` need to authenticate to GHCR.
       # docker/login-action writes the docker config that cosign reads;
       # `helm registry login` writes Helm's separate registry config.
       - name: Log in to ${{ env.REGISTRY }} (Docker config, used by cosign)
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
