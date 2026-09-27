@@ -181,7 +181,7 @@ opt-in된 namespace에서 limit이 있는 Pod를 실행하고 `/proc` 값을 확
 kubectl label namespace default lxcfs-admission-webhook=enabled --overwrite
 
 kubectl run lxcfs-check --rm -it --restart=Never \
-  --image=alpine:3.21 \
+  --image=alpine:3.24 \
   --limits=cpu=1,memory=1Gi \
   -- sh -c 'echo "nproc: $(nproc)"; head -3 /proc/meminfo; grep -c ^processor /proc/cpuinfo'
 ```

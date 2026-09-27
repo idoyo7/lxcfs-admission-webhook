@@ -20,7 +20,14 @@
 # even if it is ever rebased onto a musl base again. Both belt and braces
 # are deliberate: the base choice tracks what upstream tests, the patch
 # fixes the actual defect.
-FROM debian:bookworm-slim AS build
+# trixie (Debian 13) replaces bookworm: bookworm left regular security
+# support on 2026-07-11 and is LTS-only from there (endoflife.date/debian).
+# Trade-off: trixie's libfuse 3.17 is newer than anything in upstream's CI
+# matrix (ubuntu-22.04/24.04 ship 3.10/3.14), so the glibc half of the
+# argument above still holds but the libfuse version no longer matches
+# what upstream tests. verify-lxcfs.sh and a real DaemonSet roll are the
+# gate for that, not this comment.
+FROM debian:trixie-slim AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -121,7 +128,7 @@ RUN meson setup build --prefix=/usr --libdir=lib --localstatedir=/var \
     meson compile -C build && \
     DESTDIR=/out meson install -C build
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 LABEL maintainer="idoyo7 <idoyo7@gmail.com>"
 LABEL org.opencontainers.image.source="https://github.com/idoyo7/lxcfs-admission-webhook"
@@ -134,10 +141,12 @@ ARG LXCFS_VERSION=7.0.0
 ENV LXCFS_VERSION=${LXCFS_VERSION}
 
 # fuse3 provides both fusermount3 and fusermount (Alpine ships only the
-# former, which is why entrypoint.sh tries both names); libfuse3-3 is the
-# runtime library lxcfs links against; dumb-init reaps zombies. bash,
-# nsenter/umount (util-linux), awk, cmp, stat and coreutils' timeout
-# already ship in debian:bookworm-slim.
+# former, which is why entrypoint.sh tries both names); libfuse3-4 is the
+# runtime library lxcfs links against (trixie renamed it from bookworm's
+# libfuse3-3 with the libfuse 3.17 soname bump -- keep this in lockstep
+# with the libfuse3-dev the build stage compiled against); dumb-init reaps
+# zombies. bash, nsenter/umount (util-linux), awk, cmp, stat and
+# coreutils' timeout already ship in debian:trixie-slim.
 #
 # busybox-static is not for this container's own use. entrypoint.sh stages
 # it onto the node at /var/lib/lxc/script/busybox, from where
@@ -161,7 +170,7 @@ RUN chmod +x /lxcfs/entrypoint.sh /lxcfs/verify-lxcfs.sh /lxcfs/lxcfs-ready.sh &
     apt-get install -y --no-install-recommends \
         dumb-init \
         fuse3 \
-        libfuse3-3 \
+        libfuse3-4 \
         busybox-static && \
     rm -rf /var/lib/apt/lists/* && \
     for b in bash nsenter mount umount chroot awk cmp stat timeout fusermount3 fusermount dumb-init busybox; do \
