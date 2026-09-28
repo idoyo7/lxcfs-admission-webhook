@@ -67,6 +67,21 @@ jobs:
           echo "version=${LXCFS_VERSION}" >> "$GITHUB_OUTPUT"
           echo "revision=${LXCFS_IMAGE_REVISION}" >> "$GITHUB_OUTPUT"
 
+      # The tag below is meant to be an immutable handle: once
+      # <version>-<revision> is published it must never point at a
+      # different digest. Refuse to even build if it already exists so a
+      # push that forgets to bump LXCFS_IMAGE_REVISION fails loudly
+      # instead of silently overwriting a tag someone may already be
+      # running.
+      - name: Guard against re-publishing an existing lxcfs image tag
+        if: matrix.image == 'lxcfs' && github.event_name != 'pull_request'
+        run: |
+          ref="${{ env.REGISTRY }}/${{ github.repository_owner }}/lxcfs:${{ steps.lxcfsenv.outputs.version }}-${{ steps.lxcfsenv.outputs.revision }}"
+          if docker buildx imagetools inspect "${ref}" >/dev/null 2>&1; then
+            echo "::error::${ref} is already published. Bump LXCFS_IMAGE_REVISION in lxcfs-image/.env before publishing again." >&2
+            exit 1
+          fi
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -75,8 +90,12 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            # semver tags come from pushing a v*.*.* git tag on this repo,
+            # which describes the webhook's own release -- restrict them
+            # to that image so lxcfs never gets a webhook version tag
+            # (e.g. lxcfs:0.1.1) alongside its own <version>-<revision>.
+            type=semver,pattern={{version}},enable=${{ matrix.image == 'lxcfs-admission-webhook' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.image == 'lxcfs-admission-webhook' }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
             # Immutable handle: upstream version plus this repo's image
