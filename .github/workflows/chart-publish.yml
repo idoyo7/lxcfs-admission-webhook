@@ -95,6 +95,19 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Resolved chart version: ${version}"
 
+      # OCI chart tags are treated as immutable handles the same way the
+      # lxcfs image tags are. Refuse to republish a version that already
+      # exists in GHCR instead of silently overwriting its digest -- bump
+      # Chart.yaml's version instead.
+      - name: Guard against re-publishing an existing chart version
+        run: |
+          version="${{ steps.chartver.outputs.version }}"
+          ref="oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/lxcfs-admission-webhook"
+          if helm show chart "${ref}" --version "${version}" >/dev/null 2>&1; then
+            echo "::error::chart version ${version} is already published at ${ref}. Bump Chart.yaml's version before publishing again." >&2
+            exit 1
+          fi
+
       - name: Package chart
         run: |
           mkdir -p /tmp/chartout
